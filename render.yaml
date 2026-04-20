@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: sailtrack-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --timeout 120 --workers 2
+    envVars:
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_OWNER
+        value: wolkeyachting
+      - key: DATA_REPO
+        value: sailtrack
+      - key: ADMIN_REPO
+        value: sailtrack-admin
+      - key: SAILTRACK_TOKENS
+        sync: false
+      - key: SAILTRACK_ADMIN_TOKEN
+        sync: false
