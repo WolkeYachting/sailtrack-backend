@@ -1,24 +1,18 @@
 """
-SailTrack Backend - Phase 2a
+SailTrack Backend – v2 Datenmodell (Phase 2c)
 
-Features:
-- MultiLineString + sessions-Array
-- Session-Management (start, points, end)
-- Track-Status-Toggle (active/finished, reversibel)
-- Metadaten editieren (PATCH)
-- Punkte filtern nach manuellem ended_at
-- Skipper-Register persistent in sailtrack-admin/skippers.json
-  (POST /skippers/new, GET /whoami, Admin-Endpoints)
-- Ownership-Check: nur Track-Ersteller darf modifizieren
-- Punkt-Format: {t, lat, lon} (SOG/COG optional, werden aber nicht mehr gespeichert)
-
-Noch nicht enthalten (Phase 2b/3):
-- 10-Min-Commit-Batches (aktuell sofort)
-- Live-Endpoints
-- Recovery aus Memory
+Key changes:
+- Track ist LineString (statt MultiLineString)
+- Pausen werden separat unter properties.pauses gespeichert
+- Kein session_index mehr, weder bei Punkten noch in Datei-Struktur
+- POST /tracks/{id}/points: nur {points: [{t, lat, lon}]}
+- POST /tracks/{id}/pauses: nur {t: timestamp}
+- Server akzeptiert Punkte unabhängig vom Track-Status
+- Out-of-order Punkte werden chronologisch einsortiert
 """
 
 import base64
+import bisect
 import hashlib
 import json
 import math
@@ -44,8 +38,6 @@ DATA_REPO    = os.environ.get("DATA_REPO", "sailtrack")
 ADMIN_REPO   = os.environ.get("ADMIN_REPO", "sailtrack-admin")
 ADMIN_TOKEN  = os.environ.get("SAILTRACK_ADMIN_TOKEN", "")
 
-# Legacy Env-Var (Übergang): token=name,token=name
-# Neue Skipper kommen über POST /skippers/new ins skippers.json
 LEGACY_TOKENS_RAW = os.environ.get("SAILTRACK_TOKENS", "")
 LEGACY_TOKENS = {
     kv.split("=", 1)[0].strip(): kv.split("=", 1)[1].strip()
@@ -56,9 +48,8 @@ LEGACY_TOKENS = {
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 CODE_LENGTH   = 12
 
-# Throttle: last_seen_at wird maximal alle N Sekunden committet
-LAST_SEEN_THROTTLE_SEC = 300  # 5 Min
-_last_seen_debounce = {}  # token -> epoch seconds when last committed
+LAST_SEEN_THROTTLE_SEC = 300
+_last_seen_debounce = {}
 
 # ============================================================================
 # Helpers
@@ -71,7 +62,6 @@ def generate_code():
     return "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
 
 def generate_skipper_token():
-    """32 Byte Zufallsstring, base64-urlsafe codiert (~43 Zeichen)."""
     return secrets.token_urlsafe(32)
 
 def hash_code(code):
@@ -84,12 +74,6 @@ def haversine_nm(lat1, lon1, lat2, lon2):
     dl = math.radians(lon2 - lon1)
     a = math.sin(df/2)**2 + math.cos(f1) * math.cos(f2) * math.sin(dl/2)**2
     return 2 * R_nm * math.asin(math.sqrt(a))
-
-def iso_to_ts(iso_str):
-    if iso_str is None:
-        return None
-    iso_str = iso_str.replace("Z", "+00:00")
-    return int(datetime.fromisoformat(iso_str).timestamp())
 
 # ============================================================================
 # GitHub API
@@ -156,20 +140,12 @@ def _find_skipper(skippers_data, token):
     return None
 
 def auth_skipper():
-    """
-    Returns (skipper_name, token) or None.
-    Lookup first in skippers.json, fallback on LEGACY_TOKENS env-var.
-    """
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return None
     token = auth_header[7:]
-    
-    # 1. Legacy-Tokens (Übergang)
     if token in LEGACY_TOKENS:
         return (LEGACY_TOKENS[token], token)
-    
-    # 2. Neue Skipper aus skippers.json
     try:
         skippers_data = _load_skippers()
     except Exception:
@@ -187,13 +163,11 @@ def auth_admin():
     return ADMIN_TOKEN and auth_header[7:] == ADMIN_TOKEN
 
 def _maybe_update_last_seen(token):
-    """Committet last_seen_at nur alle LAST_SEEN_THROTTLE_SEC Sekunden."""
     now = time.time()
     last = _last_seen_debounce.get(token, 0)
     if now - last < LAST_SEEN_THROTTLE_SEC:
         return
     _last_seen_debounce[token] = now
-    
     def update(existing):
         data = existing or {"skippers": []}
         for s in data.get("skippers", []):
@@ -201,13 +175,12 @@ def _maybe_update_last_seen(token):
                 s["last_seen_at"] = now_iso()
                 break
         return data
-    
     try:
         gh_update_file_retrying(
             ADMIN_REPO, "skippers.json", update, f"last_seen: {token[:8]}..."
         )
     except Exception:
-        pass  # Non-critical; silent fail
+        pass
 
 # ============================================================================
 # Skipper-Endpoints
@@ -215,16 +188,9 @@ def _maybe_update_last_seen(token):
 
 @app.route("/skippers/new", methods=["POST"])
 def new_skipper():
-    """
-    Öffentlicher Endpoint. Erzeugt neuen Skipper-Token und speichert in skippers.json.
-    Returns: {token, name}
-    """
-    body = request.get_json(force=True, silent=True) or {}
     token = generate_skipper_token()
-    
     def update(existing):
         data = existing or {"skippers": []}
-        # Kollision quasi unmöglich, aber check'n schadet nicht
         if any(s.get("token") == token for s in data["skippers"]):
             raise ValueError("collision")
         default_name = f"Skipper-{token[:6]}"
@@ -235,11 +201,9 @@ def new_skipper():
             "last_seen_at": now_iso(),
         })
         return data
-    
     gh_update_file_retrying(
         ADMIN_REPO, "skippers.json", update, f"skipper new: {token[:8]}..."
     )
-    
     return jsonify({"token": token, "name": f"Skipper-{token[:6]}"})
 
 @app.route("/whoami", methods=["GET"])
@@ -251,15 +215,14 @@ def whoami():
     return jsonify({"name": name})
 
 # ============================================================================
-# Admin – Skipper-Verwaltung
+# Admin
 # ============================================================================
 
 @app.route("/admin/skippers", methods=["GET"])
 def admin_list_skippers():
     if not auth_admin():
         return jsonify({"error": "unauthorized"}), 401
-    data = _load_skippers()
-    return jsonify(data)
+    return jsonify(_load_skippers())
 
 @app.route("/admin/skippers/<token>", methods=["PATCH"])
 def admin_patch_skipper(token):
@@ -269,7 +232,6 @@ def admin_patch_skipper(token):
     new_name = body.get("name", "").strip()
     if not new_name:
         return jsonify({"error": "name required"}), 400
-    
     def update(existing):
         data = existing or {"skippers": []}
         for s in data.get("skippers", []):
@@ -277,19 +239,13 @@ def admin_patch_skipper(token):
                 s["name"] = new_name
                 return data
         raise ValueError("skipper not found")
-    
     try:
         gh_update_file_retrying(
             ADMIN_REPO, "skippers.json", update, f"admin: rename {token[:8]}"
         )
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
-    
     return jsonify({"token": token, "name": new_name})
-
-# ============================================================================
-# Admin-Index
-# ============================================================================
 
 def admin_index_upsert(entry):
     def update(existing):
@@ -308,7 +264,7 @@ def admin_index_upsert(entry):
     )
 
 # ============================================================================
-# Track-Struktur Helpers
+# Track-Struktur (v2: flat LineString)
 # ============================================================================
 
 def empty_track(track_id, name, boat, skipper, trip_start=None, trip_end=None):
@@ -323,45 +279,46 @@ def empty_track(track_id, name, boat, skipper, trip_start=None, trip_end=None):
             "trip_end": trip_end,
             "status": "active",
             "created_at": now_iso(),
+            "pauses": [],
             "stats": {
                 "distance_total_nm": 0.0,
                 "point_count": 0,
-                "session_count": 0,
             },
         },
         "features": [{
             "type": "Feature",
-            "geometry": {"type": "MultiLineString", "coordinates": []},
-            "properties": {"sessions": []},
+            "geometry": {"type": "LineString", "coordinates": []},
+            "properties": {"timestamps": []},
         }],
     }
 
 def recalc_stats(track):
+    """Distanz neu berechnen über alle Punkte, mit Sprüngen über Pausen."""
     feat = track["features"][0]
-    coords_all = feat["geometry"]["coordinates"]
-    sessions = feat["properties"]["sessions"]
-    
+    coords = feat["geometry"]["coordinates"]
+    timestamps = feat["properties"]["timestamps"]
+    pauses = track["properties"].get("pauses", [])
+    pauses_sorted = sorted(pauses)
+
     total_nm = 0.0
-    point_count = 0
-    
-    for sess_coords in coords_all:
-        for j in range(1, len(sess_coords)):
-            lon1, lat1 = sess_coords[j-1]
-            lon2, lat2 = sess_coords[j]
+    for j in range(1, len(coords)):
+        # Distanz zum vorigen Punkt zählt nur, wenn dazwischen KEINE Pause liegt
+        t_prev = timestamps[j-1]
+        t_cur = timestamps[j]
+        # Pause zwischen t_prev und t_cur?
+        idx = bisect.bisect_left(pauses_sorted, t_prev)
+        crossed_pause = idx < len(pauses_sorted) and pauses_sorted[idx] < t_cur
+        if not crossed_pause:
+            lon1, lat1 = coords[j-1]
+            lon2, lat2 = coords[j]
             total_nm += haversine_nm(lat1, lon1, lat2, lon2)
-        point_count += len(sess_coords)
-    
+
     track["properties"]["stats"] = {
         "distance_total_nm": round(total_nm, 3),
-        "point_count": point_count,
-        "session_count": len(sessions),
+        "point_count": len(coords),
     }
 
 def load_track_and_check_ownership(track_id, skipper_name):
-    """
-    Lädt Track, wirft Exception falls nicht vorhanden oder falscher Skipper.
-    Returns (track, file_hash).
-    """
     file_hash = hash_code(track_id)
     track, _ = gh_get_file(DATA_REPO, f"tracks/{file_hash}.geojson")
     if track is None:
@@ -379,7 +336,7 @@ def root():
     return jsonify({
         "service": "sailtrack-backend",
         "status": "ok",
-        "phase": "2a",
+        "phase": "2c",
     })
 
 @app.route("/tracks", methods=["POST"])
@@ -388,37 +345,25 @@ def create_track():
     if not skipper:
         return jsonify({"error": "unauthorized"}), 401
     skipper_name, _ = skipper
-    
     body = request.get_json(force=True, silent=True) or {}
     name = body.get("name", "").strip() or "Unbenannter Track"
     boat = body.get("boat", "").strip() or "–"
     trip_start = body.get("trip_start")
     trip_end = body.get("trip_end")
-    
     code = generate_code()
     file_hash = hash_code(code)
     track_id = code
-    
     track = empty_track(track_id, name, boat, skipper_name, trip_start, trip_end)
-    
     gh_put_file(
         DATA_REPO, f"tracks/{file_hash}.geojson",
         track, f"create track {file_hash[:8]}"
     )
-    
     admin_index_upsert({
-        "id": track_id,
-        "code": code,
-        "file_hash": file_hash,
-        "name": name,
-        "boat": boat,
-        "skipper": skipper_name,
-        "trip_start": trip_start,
-        "trip_end": trip_end,
-        "status": "active",
-        "created_at": track["properties"]["created_at"],
+        "id": track_id, "code": code, "file_hash": file_hash,
+        "name": name, "boat": boat, "skipper": skipper_name,
+        "trip_start": trip_start, "trip_end": trip_end,
+        "status": "active", "created_at": track["properties"]["created_at"],
     })
-    
     return jsonify({"id": track_id, "code": code, "file_hash": file_hash})
 
 @app.route("/tracks/<track_id>", methods=["PATCH"])
@@ -427,15 +372,12 @@ def patch_track(track_id):
     if not skipper:
         return jsonify({"error": "unauthorized"}), 401
     skipper_name, _ = skipper
-    
     body = request.get_json(force=True, silent=True) or {}
     allowed = {"name", "boat", "trip_start", "trip_end"}
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         return jsonify({"error": "no valid fields"}), 400
-    
     file_hash = hash_code(track_id)
-    
     def update(existing):
         if existing is None:
             raise LookupError("track not found")
@@ -444,7 +386,6 @@ def patch_track(track_id):
         for k, v in updates.items():
             existing["properties"][k] = v
         return existing
-    
     try:
         gh_update_file_retrying(
             DATA_REPO, f"tracks/{file_hash}.geojson", update,
@@ -454,108 +395,12 @@ def patch_track(track_id):
         return jsonify({"error": str(e)}), 404
     except PermissionError as e:
         return jsonify({"error": str(e)}), 403
-    
     admin_index_upsert({"id": track_id, **updates})
     return jsonify({"id": track_id, **updates})
 
 # ============================================================================
-# Sessions
+# Points (v2: ohne session_index, chronologisch sortiert)
 # ============================================================================
-
-@app.route("/tracks/<track_id>/sessions", methods=["POST"])
-def start_session(track_id):
-    skipper = auth_skipper()
-    if not skipper:
-        return jsonify({"error": "unauthorized"}), 401
-    skipper_name, _ = skipper
-    
-    body = request.get_json(force=True, silent=True) or {}
-    started_at = body.get("started_at") or now_iso()
-    
-    file_hash = hash_code(track_id)
-    session_index_ref = {"value": -1}
-    
-    def update(existing):
-        if existing is None:
-            raise LookupError("track not found")
-        if existing["properties"].get("skipper") != skipper_name:
-            raise PermissionError("not owner")
-        feat = existing["features"][0]
-        feat["properties"]["sessions"].append({
-            "started_at": started_at,
-            "ended_at": None,
-            "timestamps": [],
-        })
-        feat["geometry"]["coordinates"].append([])
-        session_index_ref["value"] = len(feat["properties"]["sessions"]) - 1
-        recalc_stats(existing)
-        return existing
-    
-    try:
-        gh_update_file_retrying(
-            DATA_REPO, f"tracks/{file_hash}.geojson", update,
-            f"session start {file_hash[:8]}#{session_index_ref['value']}"
-        )
-    except LookupError as e:
-        return jsonify({"error": str(e)}), 404
-    except PermissionError as e:
-        return jsonify({"error": str(e)}), 403
-    
-    return jsonify({"session_index": session_index_ref["value"]})
-
-@app.route("/tracks/<track_id>/sessions/<int:sess_idx>/end", methods=["POST"])
-def end_session(track_id, sess_idx):
-    skipper = auth_skipper()
-    if not skipper:
-        return jsonify({"error": "unauthorized"}), 401
-    skipper_name, _ = skipper
-    
-    body = request.get_json(force=True, silent=True) or {}
-    ended_at = body.get("ended_at") or now_iso()
-    ended_at_ts = iso_to_ts(ended_at)
-    
-    file_hash = hash_code(track_id)
-    
-    def update(existing):
-        if existing is None:
-            raise LookupError("track not found")
-        if existing["properties"].get("skipper") != skipper_name:
-            raise PermissionError("not owner")
-        feat = existing["features"][0]
-        sessions = feat["properties"]["sessions"]
-        coords = feat["geometry"]["coordinates"]
-        
-        if sess_idx < 0 or sess_idx >= len(sessions):
-            raise LookupError(f"session {sess_idx} not found")
-        
-        sess = sessions[sess_idx]
-        sess_coords = coords[sess_idx]
-        timestamps = sess["timestamps"]
-        
-        new_ts, new_coords = [], []
-        for i, t in enumerate(timestamps):
-            if t <= ended_at_ts:
-                new_ts.append(t)
-                new_coords.append(sess_coords[i])
-        
-        sess["timestamps"] = new_ts
-        sess["ended_at"] = ended_at
-        coords[sess_idx] = new_coords
-        
-        recalc_stats(existing)
-        return existing
-    
-    try:
-        gh_update_file_retrying(
-            DATA_REPO, f"tracks/{file_hash}.geojson", update,
-            f"session end {file_hash[:8]}#{sess_idx}"
-        )
-    except LookupError as e:
-        return jsonify({"error": str(e)}), 404
-    except PermissionError as e:
-        return jsonify({"error": str(e)}), 403
-    
-    return jsonify({"session_index": sess_idx, "ended_at": ended_at})
 
 @app.route("/tracks/<track_id>/points", methods=["POST"])
 def append_points(track_id):
@@ -563,62 +408,97 @@ def append_points(track_id):
     if not skipper:
         return jsonify({"error": "unauthorized"}), 401
     skipper_name, _ = skipper
-    
+
     body = request.get_json(force=True, silent=True) or {}
-    sess_idx = body.get("session_index")
     points = body.get("points", [])
-    
-    if sess_idx is None:
-        return jsonify({"error": "session_index required"}), 400
     if not points:
         return jsonify({"accepted": 0})
-    
+
+    # Punkte vorsortieren nach Zeit, damit der Server-Code simpel bleibt
+    points = sorted(points, key=lambda p: p["t"])
+
     file_hash = hash_code(track_id)
-    
+
     def update(existing):
         if existing is None:
             raise LookupError("track not found")
         if existing["properties"].get("skipper") != skipper_name:
             raise PermissionError("not owner")
         feat = existing["features"][0]
-        sessions = feat["properties"]["sessions"]
         coords = feat["geometry"]["coordinates"]
-        
-        if sess_idx < 0 or sess_idx >= len(sessions):
-            raise LookupError(f"session {sess_idx} not found")
-        
-        sess = sessions[sess_idx]
-        if sess["ended_at"] is not None:
-            raise ValueError(f"session {sess_idx} already ended")
-        
+        timestamps = feat["properties"]["timestamps"]
+
         for p in points:
-            coords[sess_idx].append([p["lon"], p["lat"]])
-            sess["timestamps"].append(p["t"])
-        
+            t, lat, lon = p["t"], p["lat"], p["lon"]
+            # Üblicher Fall: chronologisch hinten anhängen
+            if not timestamps or t >= timestamps[-1]:
+                timestamps.append(t)
+                coords.append([lon, lat])
+            else:
+                # Out-of-order: an die korrekte Stelle einsortieren
+                idx = bisect.bisect_left(timestamps, t)
+                timestamps.insert(idx, t)
+                coords.insert(idx, [lon, lat])
+
         recalc_stats(existing)
         return existing
-    
+
     try:
         gh_update_file_retrying(
             DATA_REPO, f"tracks/{file_hash}.geojson", update,
-            f"append {len(points)} pts to {file_hash[:8]}#{sess_idx}"
+            f"append {len(points)} pts to {file_hash[:8]}"
         )
     except LookupError as e:
         return jsonify({"error": str(e)}), 404
     except PermissionError as e:
         return jsonify({"error": str(e)}), 403
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 409
-    
+
     return jsonify({"accepted": len(points)})
 
+@app.route("/tracks/<track_id>/pauses", methods=["POST"])
+def add_pause(track_id):
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+
+    body = request.get_json(force=True, silent=True) or {}
+    t = body.get("t")
+    if t is None:
+        return jsonify({"error": "t required"}), 400
+
+    file_hash = hash_code(track_id)
+
+    def update(existing):
+        if existing is None:
+            raise LookupError("track not found")
+        if existing["properties"].get("skipper") != skipper_name:
+            raise PermissionError("not owner")
+        pauses = existing["properties"].setdefault("pauses", [])
+        if t not in pauses:
+            pauses.append(t)
+            pauses.sort()
+        recalc_stats(existing)
+        return existing
+
+    try:
+        gh_update_file_retrying(
+            DATA_REPO, f"tracks/{file_hash}.geojson", update,
+            f"pause @ {t} on {file_hash[:8]}"
+        )
+    except LookupError as e:
+        return jsonify({"error": str(e)}), 404
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+
+    return jsonify({"t": t})
+
 # ============================================================================
-# Track-Status-Toggle
+# Status-Toggle
 # ============================================================================
 
 def _set_status(track_id, new_status, skipper_name):
     file_hash = hash_code(track_id)
-    
     def update(existing):
         if existing is None:
             raise LookupError("track not found")
@@ -630,7 +510,6 @@ def _set_status(track_id, new_status, skipper_name):
         else:
             existing["properties"].pop("finished_at", None)
         return existing
-    
     updated = gh_update_file_retrying(
         DATA_REPO, f"tracks/{file_hash}.geojson", update,
         f"status->{new_status} {file_hash[:8]}"
@@ -676,7 +555,6 @@ def list_my_tracks():
     if not skipper:
         return jsonify({"error": "unauthorized"}), 401
     skipper_name, _ = skipper
-    
     existing, _ = gh_get_file(ADMIN_REPO, "index.json")
     if not existing:
         return jsonify([])
@@ -689,12 +567,10 @@ def list_my_tracks():
 
 @app.route("/tracks/<track_id>", methods=["GET"])
 def get_track(track_id):
-    """Volle Track-Daten. Ownership-Check, da es sonst Code leaken könnte."""
     skipper = auth_skipper()
     if not skipper:
         return jsonify({"error": "unauthorized"}), 401
     skipper_name, _ = skipper
-    
     file_hash = hash_code(track_id)
     existing, _ = gh_get_file(DATA_REPO, f"tracks/{file_hash}.geojson")
     if not existing:
