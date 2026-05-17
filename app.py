@@ -89,30 +89,142 @@ def gh_headers():
     }
 
 def gh_get_file(repo, path):
+    """
+    Liest eine JSON-Datei aus dem Repo.
+
+    Die Contents-API liefert `content` nur inline, solange die Datei < 1 MB ist.
+    Ab 1 MB ist `content` leer und `encoding` == "none" -> der eigentliche
+    Inhalt muss ueber die Git Blob API (per `git_url`) nachgeladen werden.
+    Die Blob-API hat kein 1-MB-Limit (bis 100 MB).
+
+    Rueckgabe: (parsed_dict_oder_None, blob_sha_oder_None)
+    Der zurueckgegebene SHA ist der Blob-SHA der Datei und wird von
+    gh_put_file fuer den Tree-Diff bzw. die Existenzpruefung verwendet.
+    """
     url = f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/contents/{path}"
     r = requests.get(url, headers=gh_headers(), timeout=30)
     if r.status_code == 404:
         return None, None
     r.raise_for_status()
     data = r.json()
-    content = base64.b64decode(data["content"]).decode("utf-8")
-    return json.loads(content), data["sha"]
+
+    if data.get("encoding") == "base64" and data.get("content"):
+        # Kleine Datei: Inhalt kommt inline mit
+        raw = base64.b64decode(data["content"])
+    else:
+        # Grosse Datei (>= 1 MB): content ist leer -> Blob separat holen
+        blob = requests.get(data["git_url"], headers=gh_headers(), timeout=30)
+        blob.raise_for_status()
+        raw = base64.b64decode(blob.json()["content"])
+
+    text = raw.decode("utf-8")
+    if not text.strip():
+        # Leere oder kaputte Datei nicht als JSON parsen
+        return None, data["sha"]
+    return json.loads(text), data["sha"]
+
+def _gh_default_branch(repo):
+    r = requests.get(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}",
+        headers=gh_headers(), timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["default_branch"]
+
 
 def gh_put_file(repo, path, content_dict, message, sha=None):
-    url = f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/contents/{path}"
-    body = {
-        "message": message,
-        "content": base64.b64encode(
-            json.dumps(content_dict, indent=2, ensure_ascii=False).encode("utf-8")
-        ).decode("ascii"),
-    }
-    if sha:
-        body["sha"] = sha
-    r = requests.put(url, headers=gh_headers(), json=body, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    """
+    Schreibt eine JSON-Datei ueber die Git Data API.
+
+    Die Contents-API (PUT /contents) akzeptiert nur Dateien < 1 MB. Die
+    Track-GeoJSONs haben dieses Limit erreicht, daher wird hier der
+    Blob/Tree/Commit/Ref-Weg genutzt, der bis 100 MB traegt. Funktioniert
+    fuer kleine Dateien (skippers.json, index.json) ebenso.
+
+    Der `sha`-Parameter wird fuer Optimistic-Concurrency nicht mehr
+    gebraucht (das uebernimmt das Ref-Update), bleibt aber in der Signatur,
+    damit bestehende Aufrufer unveraendert funktionieren.
+    """
+    branch = _gh_default_branch(repo)
+
+    # Aktuellen Commit der Branch-Spitze ermitteln
+    ref_url = f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/ref/heads/{branch}"
+    ref = requests.get(ref_url, headers=gh_headers(), timeout=30)
+    ref.raise_for_status()
+    base_commit_sha = ref.json()["object"]["sha"]
+
+    commit = requests.get(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/commits/{base_commit_sha}",
+        headers=gh_headers(), timeout=30,
+    )
+    commit.raise_for_status()
+    base_tree_sha = commit.json()["tree"]["sha"]
+
+    payload = json.dumps(content_dict, indent=2, ensure_ascii=False)
+
+    # 1) Blob anlegen
+    blob = requests.post(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/blobs",
+        headers=gh_headers(), timeout=30,
+        json={
+            "content": base64.b64encode(payload.encode("utf-8")).decode("ascii"),
+            "encoding": "base64",
+        },
+    )
+    blob.raise_for_status()
+    blob_sha = blob.json()["sha"]
+
+    # 2) Tree mit der geaenderten Datei erzeugen
+    tree = requests.post(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/trees",
+        headers=gh_headers(), timeout=30,
+        json={
+            "base_tree": base_tree_sha,
+            "tree": [{
+                "path": path,
+                "mode": "100644",
+                "type": "blob",
+                "sha": blob_sha,
+            }],
+        },
+    )
+    tree.raise_for_status()
+    new_tree_sha = tree.json()["sha"]
+
+    # 3) Commit erzeugen
+    new_commit = requests.post(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/commits",
+        headers=gh_headers(), timeout=30,
+        json={
+            "message": message,
+            "tree": new_tree_sha,
+            "parents": [base_commit_sha],
+        },
+    )
+    new_commit.raise_for_status()
+    new_commit_sha = new_commit.json()["sha"]
+
+    # 4) Branch-Ref auf den neuen Commit setzen (ohne force).
+    #    Hat sich die Branch-Spitze zwischenzeitlich bewegt, antwortet
+    #    GitHub mit 422 -> wird von gh_update_file_retrying als Konflikt
+    #    behandelt und der Vorgang wiederholt.
+    upd = requests.patch(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/refs/heads/{branch}",
+        headers=gh_headers(), timeout=30,
+        json={"sha": new_commit_sha, "force": False},
+    )
+    upd.raise_for_status()
+    return upd.json()
 
 def gh_update_file_retrying(repo, path, updater_fn, message):
+    """
+    Liest die Datei, wendet updater_fn an und schreibt zurueck.
+
+    Bei einem Schreibkonflikt (parallele Aenderung an der Branch-Spitze)
+    wird der komplette Read-Modify-Write-Zyklus wiederholt. Da das Schreiben
+    jetzt ueber die Git Data API laeuft, meldet sich ein Konflikt beim
+    Ref-Update als HTTP 422 ("Update is not a fast forward").
+    """
     for attempt in range(3):
         existing, sha = gh_get_file(repo, path)
         new_content = updater_fn(existing)
@@ -120,7 +232,8 @@ def gh_update_file_retrying(repo, path, updater_fn, message):
             gh_put_file(repo, path, new_content, message, sha=sha)
             return new_content
         except requests.HTTPError as e:
-            if e.response.status_code == 409 and attempt < 2:
+            status = e.response.status_code if e.response is not None else None
+            if status in (409, 422) and attempt < 2:
                 time.sleep(0.5 * (attempt + 1))
                 continue
             raise
