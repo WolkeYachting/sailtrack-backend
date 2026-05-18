@@ -224,10 +224,16 @@ def gh_update_file_retrying(repo, path, updater_fn, message):
     wird der komplette Read-Modify-Write-Zyklus wiederholt. Da das Schreiben
     jetzt ueber die Git Data API laeuft, meldet sich ein Konflikt beim
     Ref-Update als HTTP 422 ("Update is not a fast forward").
+
+    Gibt updater_fn None zurueck, ist nichts zu schreiben (z.B. ein
+    Punkte-Schwung, der nur aus Dubletten bestand) -> der GitHub-Commit
+    wird uebersprungen und None zurueckgegeben.
     """
     for attempt in range(3):
         existing, sha = gh_get_file(repo, path)
         new_content = updater_fn(existing)
+        if new_content is None:
+            return None
         try:
             gh_put_file(repo, path, new_content, message, sha=sha)
             return new_content
@@ -532,6 +538,10 @@ def append_points(track_id):
 
     file_hash = hash_code(track_id)
 
+    # Wird vom updater befuellt, damit die Response die echten Zahlen kennt.
+    # Liste, damit die innere Closure schreiben kann (kein nonlocal noetig).
+    result = {"accepted": 0, "duplicates": 0}
+
     def update(existing):
         if existing is None:
             raise LookupError("track not found")
@@ -541,8 +551,20 @@ def append_points(track_id):
         coords = feat["geometry"]["coordinates"]
         timestamps = feat["properties"]["timestamps"]
 
+        # Set der bereits vorhandenen Timestamps fuer O(1)-Dublettenpruefung.
+        # Macht den Append idempotent: Sendet die App nach einem
+        # unklaren Fehlschlag denselben Schwung erneut, werden bereits
+        # gespeicherte Punkte uebersprungen statt doppelt eingefuegt.
+        seen = set(timestamps)
+        accepted = 0
+        duplicates = 0
+
         for p in points:
             t, lat, lon = p["t"], p["lat"], p["lon"]
+            if t in seen:
+                duplicates += 1
+                continue
+            seen.add(t)
             # Üblicher Fall: chronologisch hinten anhängen
             if not timestamps or t >= timestamps[-1]:
                 timestamps.append(t)
@@ -552,6 +574,16 @@ def append_points(track_id):
                 idx = bisect.bisect_left(timestamps, t)
                 timestamps.insert(idx, t)
                 coords.insert(idx, [lon, lat])
+            accepted += 1
+
+        result["accepted"] = accepted
+        result["duplicates"] = duplicates
+
+        # Hat der Schwung ausschliesslich Dubletten enthalten, ist nichts
+        # zu schreiben -> None signalisiert gh_update_file_retrying, den
+        # GitHub-Commit zu ueberspringen (spart einen leeren Commit).
+        if accepted == 0:
+            return None
 
         recalc_stats(existing)
         return existing
@@ -566,7 +598,10 @@ def append_points(track_id):
     except PermissionError as e:
         return jsonify({"error": str(e)}), 403
 
-    return jsonify({"accepted": len(points)})
+    return jsonify({
+        "accepted": result["accepted"],
+        "duplicates": result["duplicates"],
+    })
 
 @app.route("/tracks/<track_id>/pauses", methods=["POST"])
 def add_pause(track_id):
