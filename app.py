@@ -75,27 +75,29 @@ def haversine_nm(lat1, lon1, lat2, lon2):
     a = math.sin(df/2)**2 + math.cos(f1) * math.cos(f2) * math.sin(dl/2)**2
     return 2 * R_nm * math.asin(math.sqrt(a))
 
+def _norm_ts(timestamps):
+    """Kanonische Punkt-Identitaet: auf ganze Sekunden trunkieren UND
+    deduplizieren, dann sortieren. Spiegelt das App-Modell, wo der
+    Primaerschluessel die Sekunde ist (zwei Sub-Sekunden-Punkte derselben
+    Sekunde sind dort EIN Punkt). So vergleichen Server und App dasselbe."""
+    return sorted({int(t) for t in timestamps})
+
 def ts_hash(timestamps):
     """
-    Fingerabdruck ueber die SORTIERTE Timestamp-Folge eines Tracks.
+    Fingerabdruck ueber die kanonische (sortiert, Int, dedupliziert)
+    Timestamp-Folge eines Tracks.
 
-    Da der Timestamp die Punkt-Identitaet ist (Dedup-Schluessel), bedeutet
-    gleicher Hash beidseitig: identische Punktmenge. Wird vom App-Client vor
-    einem "Daten vom Geraet entfernen" verglichen -- nur bei Gleichheit wird
-    lokal geloescht.
+    Da der Timestamp die Punkt-Identitaet ist, bedeutet gleicher Hash
+    beidseitig: identische Punktmenge. Wird vom App-Client vor einem "Daten
+    vom Geraet entfernen" sowie beim Sync-Status verglichen.
 
     WICHTIG: Der Algorithmus (FNV-1a, 64 Bit, ueber die mit "," verbundenen
     Dezimal-Strings der sortierten Ints) MUSS bitgenau zur Dart-Seite passen
-    (fnv1a64Hex in store.dart). Aenderungen hier ohne dort = stiller Bruch.
-
-    Timestamps werden zu INT normalisiert (truncate), bevor sie gehasht
-    werden. Grund: Alt-Tracks haben Timestamps teils als Float gespeichert
-    (1717521600.0); die App haelt sie als Int (1717521600) und trunkiert beim
-    Download mit .toInt(). Ohne Normalisierung ergaeben "1717521600.0" und
-    "1717521600" verschiedene Hashes trotz identischer Punktmenge -> ewige
-    "Abweichung". Bei reinen Int-Timestamps (Neu-Tracks) ist int(t) ein No-Op.
+    (fnv1a64Hex in store.dart, das ueber die Int-Sekunden der pending_points
+    rechnet -- dort ist die Sekunde ohnehin Primaerschluessel, also schon
+    dedupliziert).
     """
-    ints = sorted(int(t) for t in timestamps)
+    ints = _norm_ts(timestamps)
     s = ",".join(str(x) for x in ints)
     h = 0xcbf29ce484222325
     for b in s.encode("utf-8"):
@@ -855,9 +857,10 @@ def get_track_digest(track_id):
     if existing["properties"].get("skipper") != skipper_name:
         return jsonify({"error": "not owner"}), 403
     timestamps = existing["features"][0]["properties"].get("timestamps", [])
+    norm = _norm_ts(timestamps)
     return jsonify({
-        "point_count": len(timestamps),
-        "last_t": int(timestamps[-1]) if timestamps else None,
+        "point_count": len(norm),
+        "last_t": norm[-1] if norm else None,
         "ts_hash": ts_hash(timestamps),
     })
 
