@@ -87,8 +87,16 @@ def ts_hash(timestamps):
     WICHTIG: Der Algorithmus (FNV-1a, 64 Bit, ueber die mit "," verbundenen
     Dezimal-Strings der sortierten Ints) MUSS bitgenau zur Dart-Seite passen
     (fnv1a64Hex in store.dart). Aenderungen hier ohne dort = stiller Bruch.
+
+    Timestamps werden zu INT normalisiert (truncate), bevor sie gehasht
+    werden. Grund: Alt-Tracks haben Timestamps teils als Float gespeichert
+    (1717521600.0); die App haelt sie als Int (1717521600) und trunkiert beim
+    Download mit .toInt(). Ohne Normalisierung ergaeben "1717521600.0" und
+    "1717521600" verschiedene Hashes trotz identischer Punktmenge -> ewige
+    "Abweichung". Bei reinen Int-Timestamps (Neu-Tracks) ist int(t) ein No-Op.
     """
-    s = ",".join(str(t) for t in sorted(timestamps))
+    ints = sorted(int(t) for t in timestamps)
+    s = ",".join(str(x) for x in ints)
     h = 0xcbf29ce484222325
     for b in s.encode("utf-8"):
         h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
@@ -849,7 +857,7 @@ def get_track_digest(track_id):
     timestamps = existing["features"][0]["properties"].get("timestamps", [])
     return jsonify({
         "point_count": len(timestamps),
-        "last_t": timestamps[-1] if timestamps else None,
+        "last_t": int(timestamps[-1]) if timestamps else None,
         "ts_hash": ts_hash(timestamps),
     })
 
