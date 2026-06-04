@@ -75,6 +75,25 @@ def haversine_nm(lat1, lon1, lat2, lon2):
     a = math.sin(df/2)**2 + math.cos(f1) * math.cos(f2) * math.sin(dl/2)**2
     return 2 * R_nm * math.asin(math.sqrt(a))
 
+def ts_hash(timestamps):
+    """
+    Fingerabdruck ueber die SORTIERTE Timestamp-Folge eines Tracks.
+
+    Da der Timestamp die Punkt-Identitaet ist (Dedup-Schluessel), bedeutet
+    gleicher Hash beidseitig: identische Punktmenge. Wird vom App-Client vor
+    einem "Daten vom Geraet entfernen" verglichen -- nur bei Gleichheit wird
+    lokal geloescht.
+
+    WICHTIG: Der Algorithmus (FNV-1a, 64 Bit, ueber die mit "," verbundenen
+    Dezimal-Strings der sortierten Ints) MUSS bitgenau zur Dart-Seite passen
+    (fnv1a64Hex in store.dart). Aenderungen hier ohne dort = stiller Bruch.
+    """
+    s = ",".join(str(t) for t in sorted(timestamps))
+    h = 0xcbf29ce484222325
+    for b in s.encode("utf-8"):
+        h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return format(h, "016x")
+
 # ============================================================================
 # GitHub API
 # ============================================================================
@@ -215,6 +234,73 @@ def gh_put_file(repo, path, content_dict, message, sha=None):
     )
     upd.raise_for_status()
     return upd.json()
+
+def gh_delete_file(repo, path, message):
+    """
+    Loescht eine Datei ueber die Git Data API.
+
+    Analog zu gh_put_file, nur dass der Tree-Eintrag fuer den Pfad mit
+    sha=None gesetzt wird -- das entfernt die Datei im neuen Tree. Funktioniert
+    auch fuer >1-MB-Dateien (die Contents-DELETE-API kann das nicht).
+
+    Gibt True zurueck, wenn geloescht wurde, False wenn die Datei gar nicht
+    existierte (idempotent).
+    """
+    # Existiert die Datei ueberhaupt? Wenn nicht: nichts zu tun.
+    _, existing_sha = gh_get_file(repo, path)
+    if existing_sha is None:
+        return False
+
+    branch = _gh_default_branch(repo)
+
+    ref_url = f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/ref/heads/{branch}"
+    ref = requests.get(ref_url, headers=gh_headers(), timeout=30)
+    ref.raise_for_status()
+    base_commit_sha = ref.json()["object"]["sha"]
+
+    commit = requests.get(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/commits/{base_commit_sha}",
+        headers=gh_headers(), timeout=30,
+    )
+    commit.raise_for_status()
+    base_tree_sha = commit.json()["tree"]["sha"]
+
+    # Tree-Eintrag mit sha=None -> GitHub entfernt die Datei.
+    tree = requests.post(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/trees",
+        headers=gh_headers(), timeout=30,
+        json={
+            "base_tree": base_tree_sha,
+            "tree": [{
+                "path": path,
+                "mode": "100644",
+                "type": "blob",
+                "sha": None,
+            }],
+        },
+    )
+    tree.raise_for_status()
+    new_tree_sha = tree.json()["sha"]
+
+    new_commit = requests.post(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/commits",
+        headers=gh_headers(), timeout=30,
+        json={
+            "message": message,
+            "tree": new_tree_sha,
+            "parents": [base_commit_sha],
+        },
+    )
+    new_commit.raise_for_status()
+    new_commit_sha = new_commit.json()["sha"]
+
+    upd = requests.patch(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/refs/heads/{branch}",
+        headers=gh_headers(), timeout=30,
+        json={"sha": new_commit_sha, "force": False},
+    )
+    upd.raise_for_status()
+    return True
 
 def gh_update_file_retrying(repo, path, updater_fn, message):
     """
@@ -380,6 +466,21 @@ def admin_index_upsert(entry):
         return data
     gh_update_file_retrying(
         ADMIN_REPO, "index.json", update, f"admin: upsert {entry['id']}"
+    )
+
+def admin_index_remove(track_id):
+    """Entfernt einen Track-Eintrag aus dem Admin-Index. Idempotent:
+    fehlt der Eintrag (oder die Index-Datei) bereits, passiert nichts."""
+    def update(existing):
+        if not existing or "tracks" not in existing:
+            return None  # nichts zu schreiben
+        before = len(existing["tracks"])
+        existing["tracks"] = [t for t in existing["tracks"] if t.get("id") != track_id]
+        if len(existing["tracks"]) == before:
+            return None  # war nicht drin -> kein leerer Commit
+        return existing
+    gh_update_file_retrying(
+        ADMIN_REPO, "index.json", update, f"admin: remove {track_id}"
     )
 
 # ============================================================================
@@ -726,6 +827,61 @@ def get_track(track_id):
     if existing["properties"].get("skipper") != skipper_name:
         return jsonify({"error": "not owner"}), 403
     return jsonify(existing)
+
+@app.route("/tracks/<track_id>/digest", methods=["GET"])
+def get_track_digest(track_id):
+    """
+    Schlanker Fingerabdruck eines Tracks: nur point_count, last_t und ts_hash
+    -- ein paar Bytes statt des kompletten GeoJSON. Die App vergleicht das vor
+    dem "Daten vom Geraet entfernen", um sicherzugehen, dass der Server exakt
+    die lokale Punktmenge hat. Stimmen Anzahl UND Hash, ist Loeschen sicher.
+    """
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+    file_hash = hash_code(track_id)
+    existing, _ = gh_get_file(DATA_REPO, f"tracks/{file_hash}.geojson")
+    if not existing:
+        return jsonify({"error": "track not found"}), 404
+    if existing["properties"].get("skipper") != skipper_name:
+        return jsonify({"error": "not owner"}), 403
+    timestamps = existing["features"][0]["properties"].get("timestamps", [])
+    return jsonify({
+        "point_count": len(timestamps),
+        "last_t": timestamps[-1] if timestamps else None,
+        "ts_hash": ts_hash(timestamps),
+    })
+
+@app.route("/tracks/<track_id>", methods=["DELETE"])
+def delete_track(track_id):
+    """
+    Loescht einen Track endgueltig: GeoJSON aus dem Daten-Repo + Eintrag aus
+    dem Admin-Index. Danach ist der Toern auch ueber den oeffentlichen Link
+    (track.html) nicht mehr erreichbar.
+
+    Idempotent: Ist die Datei schon weg (404), gilt das als Erfolg, damit ein
+    aus der App-Warteschlange erneut gesendeter Loeschbefehl sauber durchlaeuft
+    statt haengenzubleiben. Der Index wird in dem Fall trotzdem bereinigt.
+    """
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+    file_hash = hash_code(track_id)
+
+    existing, _ = gh_get_file(DATA_REPO, f"tracks/{file_hash}.geojson")
+    if existing is None:
+        # Schon geloescht -> Index sicherheitshalber aufraeumen, Erfolg melden.
+        admin_index_remove(track_id)
+        return jsonify({"deleted": True, "already_gone": True})
+    if existing["properties"].get("skipper") != skipper_name:
+        return jsonify({"error": "not owner"}), 403
+
+    gh_delete_file(DATA_REPO, f"tracks/{file_hash}.geojson",
+                   f"delete track {file_hash[:8]}")
+    admin_index_remove(track_id)
+    return jsonify({"deleted": True})
 
 @app.route("/admin/index", methods=["GET"])
 def admin_index():
