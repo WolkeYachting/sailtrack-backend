@@ -1,14 +1,42 @@
 """
-SailTrack Backend – v2 Datenmodell (Phase 2c)
+SailTrack Backend – v3 Datenmodell (Segment-Split)
 
-Key changes:
-- Track ist LineString (statt MultiLineString)
-- Pausen werden separat unter properties.pauses gespeichert
-- Kein session_index mehr, weder bei Punkten noch in Datei-Struktur
-- POST /tracks/{id}/points: nur {points: [{t, lat, lon}]}
-- POST /tracks/{id}/pauses: nur {t: timestamp}
-- Server akzeptiert Punkte unabhängig vom Track-Status
-- Out-of-order Punkte werden chronologisch einsortiert
+WARUM v3
+--------
+Bis v2 lag ein Toern in EINER Datei: ein flacher LineString plus ein
+paralleles `timestamps`-Array, sortiert nach t. Das war der Grund, warum der
+Uhrsprung vom 19.06.2026 (~+3557 s) so verheerend war: Die falsch gestempelten
+Punkte wurden zwischen die zeitgleich aufgenommenen echten Punkte einsortiert.
+Aus 220 nm wurden 4341 nm.
+
+Die Zeitbasis der App (clock.dart) verhindert das jetzt. Was bleibt, ist der
+Fall, den sie NICHT abfangen kann: Reboot mitten im Toern, Systemuhr steht in
+dem Moment falsch -> der neue Anker ist falsch -> die ganze folgende Aufnahme
+ist verschoben. Lokal nicht erkennbar (in sich konsistent), und im
+Ein-Datei-Modell wuerde sie sich beim Sortieren mit der vorherigen Aufnahme
+vermischen.
+
+v3 zieht die Konsequenz:
+
+    Neuer Anker  ->  neues Segment  ->  eigene Datei.
+
+Innerhalb einer Datei gilt Monotonie. UEBER Dateien hinweg wird nie sortiert --
+die Reihenfolge ergibt sich aus der Segmentnummer. Zeitliche Ueberlappung
+zweier Segmente ist damit ein ANZEIGE-Hinweis (`conflict`), kein Datenschaden.
+Und eine nachtraegliche Zeitkorrektur ist ein simples Verschieben genau einer
+Datei.
+
+DATEILAYOUT
+-----------
+    tracks/<hash>/<hash>.geojson        Manifest: Toern-Meta + Segment-Index
+    tracks/<hash>/<hash>-s001.geojson   Segment: LineString + timestamps + Anker
+    tracks/<hash>/<hash>-s002.geojson
+
+`pauses` faellt ersatzlos weg: Die Luecke zwischen zwei Segmenten IST die Pause.
+(Passte schon vorher exakt -- Pausen entstanden genau beim stopTracking.)
+
+Das Manifest traegt pro Segment `point_count` und `ts_hash`. Damit ist
+GET /digest ein einziger kleiner Dateizugriff statt eines Vollscans.
 """
 
 import base64
@@ -17,6 +45,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timezone
@@ -51,6 +80,8 @@ CODE_LENGTH   = 12
 LAST_SEEN_THROTTLE_SEC = 300
 _last_seen_debounce = {}
 
+SEG_RE = re.compile(r"^s\d{3}$")
+
 # ============================================================================
 # Helpers
 # ============================================================================
@@ -76,26 +107,23 @@ def haversine_nm(lat1, lon1, lat2, lon2):
     return 2 * R_nm * math.asin(math.sqrt(a))
 
 def _norm_ts(timestamps):
-    """Kanonische Punkt-Identitaet: auf ganze Sekunden trunkieren UND
-    deduplizieren, dann sortieren. Spiegelt das App-Modell, wo der
-    Primaerschluessel die Sekunde ist (zwei Sub-Sekunden-Punkte derselben
-    Sekunde sind dort EIN Punkt). So vergleichen Server und App dasselbe."""
+    """Kanonische Punkt-Identitaet INNERHALB eines Segments: auf ganze Sekunden
+    trunkieren, deduplizieren, sortieren.
+
+    Wichtig: Die Identitaet ist ab v3 (track, segment, t) -- nicht mehr
+    (track, t). Zwei Segmente duerfen dieselbe Sekunde tragen; das ist genau
+    der Reboot-mit-falscher-Uhr-Fall. Deshalb wird hier IMMER nur ueber die
+    Timestamps EINES Segments gerechnet, nie ueber den ganzen Toern.
+    """
     return sorted({int(t) for t in timestamps})
 
 def ts_hash(timestamps):
     """
-    Fingerabdruck ueber die kanonische (sortiert, Int, dedupliziert)
-    Timestamp-Folge eines Tracks.
+    Fingerabdruck ueber die kanonische Timestamp-Folge EINES SEGMENTS.
 
-    Da der Timestamp die Punkt-Identitaet ist, bedeutet gleicher Hash
-    beidseitig: identische Punktmenge. Wird vom App-Client vor einem "Daten
-    vom Geraet entfernen" sowie beim Sync-Status verglichen.
-
-    WICHTIG: Der Algorithmus (FNV-1a, 64 Bit, ueber die mit "," verbundenen
-    Dezimal-Strings der sortierten Ints) MUSS bitgenau zur Dart-Seite passen
-    (fnv1a64Hex in store.dart, das ueber die Int-Sekunden der pending_points
-    rechnet -- dort ist die Sekunde ohnehin Primaerschluessel, also schon
-    dedupliziert).
+    Muss bitgenau zur Dart-Seite passen (fnv1a64Hex in store.dart), die ueber
+    die Int-Sekunden der pending_points eines Segments rechnet. FNV-1a, 64 Bit,
+    ueber die mit "," verbundenen Dezimal-Strings der sortierten Ints.
     """
     ints = _norm_ts(timestamps)
     s = ",".join(str(x) for x in ints)
@@ -103,6 +131,23 @@ def ts_hash(timestamps):
     for b in s.encode("utf-8"):
         h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
     return format(h, "016x")
+
+# ============================================================================
+# Pfade
+# ============================================================================
+
+def track_dir(file_hash):
+    return f"tracks/{file_hash}"
+
+def manifest_path(file_hash):
+    return f"tracks/{file_hash}/{file_hash}.geojson"
+
+def segment_path(file_hash, seg):
+    return f"tracks/{file_hash}/{file_hash}-{seg}.geojson"
+
+def legacy_path(file_hash):
+    """v2: eine Datei direkt unter tracks/."""
+    return f"tracks/{file_hash}.geojson"
 
 # ============================================================================
 # GitHub API
@@ -122,13 +167,11 @@ def gh_get_file(repo, path):
     Liest eine JSON-Datei aus dem Repo.
 
     Die Contents-API liefert `content` nur inline, solange die Datei < 1 MB ist.
-    Ab 1 MB ist `content` leer und `encoding` == "none" -> der eigentliche
-    Inhalt muss ueber die Git Blob API (per `git_url`) nachgeladen werden.
-    Die Blob-API hat kein 1-MB-Limit (bis 100 MB).
+    Ab 1 MB ist `content` leer und `encoding` == "none" -> der Inhalt muss ueber
+    die Git Blob API (per `git_url`) nachgeladen werden. Die Blob-API hat kein
+    1-MB-Limit (bis 100 MB).
 
     Rueckgabe: (parsed_dict_oder_None, blob_sha_oder_None)
-    Der zurueckgegebene SHA ist der Blob-SHA der Datei und wird von
-    gh_put_file fuer den Tree-Diff bzw. die Existenzpruefung verwendet.
     """
     url = f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/contents/{path}"
     r = requests.get(url, headers=gh_headers(), timeout=30)
@@ -137,20 +180,33 @@ def gh_get_file(repo, path):
     r.raise_for_status()
     data = r.json()
 
+    if isinstance(data, list):
+        # Pfad ist ein Verzeichnis -- als Datei gelesen ist das ein Fehler.
+        return None, None
+
     if data.get("encoding") == "base64" and data.get("content"):
-        # Kleine Datei: Inhalt kommt inline mit
         raw = base64.b64decode(data["content"])
     else:
-        # Grosse Datei (>= 1 MB): content ist leer -> Blob separat holen
         blob = requests.get(data["git_url"], headers=gh_headers(), timeout=30)
         blob.raise_for_status()
         raw = base64.b64decode(blob.json()["content"])
 
     text = raw.decode("utf-8")
     if not text.strip():
-        # Leere oder kaputte Datei nicht als JSON parsen
         return None, data["sha"]
     return json.loads(text), data["sha"]
+
+def gh_list_dir(repo, path):
+    """Dateinamen eines Verzeichnisses. Leere Liste, wenn es nicht existiert."""
+    url = f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/contents/{path}"
+    r = requests.get(url, headers=gh_headers(), timeout=30)
+    if r.status_code == 404:
+        return []
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list):
+        return []
+    return [e["path"] for e in data if e.get("type") == "file"]
 
 def _gh_default_branch(repo):
     r = requests.get(
@@ -160,23 +216,26 @@ def _gh_default_branch(repo):
     r.raise_for_status()
     return r.json()["default_branch"]
 
-
-def gh_put_file(repo, path, content_dict, message, sha=None):
+def gh_commit_files(repo, writes, deletes, message):
     """
-    Schreibt eine JSON-Datei ueber die Git Data API.
+    Schreibt und loescht MEHRERE Dateien in EINEM Commit (Git Data API).
 
-    Die Contents-API (PUT /contents) akzeptiert nur Dateien < 1 MB. Die
-    Track-GeoJSONs haben dieses Limit erreicht, daher wird hier der
-    Blob/Tree/Commit/Ref-Weg genutzt, der bis 100 MB traegt. Funktioniert
-    fuer kleine Dateien (skippers.json, index.json) ebenso.
+    Das ist ab v3 der Normalfall: Ein Punkte-Append fasst Segmentdatei UND
+    Manifest an. Beides in einem Commit heisst: Es kann keinen Zustand geben,
+    in dem das Manifest andere Zahlen behauptet, als in den Segmenten stehen.
+    Zwei getrennte Commits koennten genau dort auseinanderlaufen.
 
-    Der `sha`-Parameter wird fuer Optimistic-Concurrency nicht mehr
-    gebraucht (das uebernimmt das Ref-Update), bleibt aber in der Signatur,
-    damit bestehende Aufrufer unveraendert funktionieren.
+    writes:  {pfad: dict}
+    deletes: [pfad, ...]   (nicht existierende Pfade bitte vorher filtern)
+
+    Die Contents-API kann das alles nicht (nur eine Datei, und nur < 1 MB) --
+    daher der Blob/Tree/Commit/Ref-Weg, der bis 100 MB traegt.
     """
+    if not writes and not deletes:
+        return None
+
     branch = _gh_default_branch(repo)
 
-    # Aktuellen Commit der Branch-Spitze ermitteln
     ref_url = f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/ref/heads/{branch}"
     ref = requests.get(ref_url, headers=gh_headers(), timeout=30)
     ref.raise_for_status()
@@ -189,38 +248,37 @@ def gh_put_file(repo, path, content_dict, message, sha=None):
     commit.raise_for_status()
     base_tree_sha = commit.json()["tree"]["sha"]
 
-    payload = json.dumps(content_dict, indent=2, ensure_ascii=False)
+    tree_entries = []
 
-    # 1) Blob anlegen
-    blob = requests.post(
-        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/blobs",
-        headers=gh_headers(), timeout=30,
-        json={
-            "content": base64.b64encode(payload.encode("utf-8")).decode("ascii"),
-            "encoding": "base64",
-        },
-    )
-    blob.raise_for_status()
-    blob_sha = blob.json()["sha"]
+    for path, content in writes.items():
+        payload = json.dumps(content, indent=2, ensure_ascii=False)
+        blob = requests.post(
+            f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/blobs",
+            headers=gh_headers(), timeout=60,
+            json={
+                "content": base64.b64encode(payload.encode("utf-8")).decode("ascii"),
+                "encoding": "base64",
+            },
+        )
+        blob.raise_for_status()
+        tree_entries.append({
+            "path": path, "mode": "100644", "type": "blob",
+            "sha": blob.json()["sha"],
+        })
 
-    # 2) Tree mit der geaenderten Datei erzeugen
+    for path in deletes:
+        tree_entries.append({
+            "path": path, "mode": "100644", "type": "blob", "sha": None,
+        })
+
     tree = requests.post(
         f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/trees",
-        headers=gh_headers(), timeout=30,
-        json={
-            "base_tree": base_tree_sha,
-            "tree": [{
-                "path": path,
-                "mode": "100644",
-                "type": "blob",
-                "sha": blob_sha,
-            }],
-        },
+        headers=gh_headers(), timeout=60,
+        json={"base_tree": base_tree_sha, "tree": tree_entries},
     )
     tree.raise_for_status()
     new_tree_sha = tree.json()["sha"]
 
-    # 3) Commit erzeugen
     new_commit = requests.post(
         f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/commits",
         headers=gh_headers(), timeout=30,
@@ -233,10 +291,7 @@ def gh_put_file(repo, path, content_dict, message, sha=None):
     new_commit.raise_for_status()
     new_commit_sha = new_commit.json()["sha"]
 
-    # 4) Branch-Ref auf den neuen Commit setzen (ohne force).
-    #    Hat sich die Branch-Spitze zwischenzeitlich bewegt, antwortet
-    #    GitHub mit 422 -> wird von gh_update_file_retrying als Konflikt
-    #    behandelt und der Vorgang wiederholt.
+    # Ohne force: Hat sich die Branch-Spitze bewegt -> 422 -> Retry im Wrapper.
     upd = requests.patch(
         f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/refs/heads/{branch}",
         headers=gh_headers(), timeout=30,
@@ -245,100 +300,39 @@ def gh_put_file(repo, path, content_dict, message, sha=None):
     upd.raise_for_status()
     return upd.json()
 
-def gh_delete_file(repo, path, message):
+def gh_update_files_retrying(repo, read_paths, updater_fn, message):
     """
-    Loescht eine Datei ueber die Git Data API.
+    Read-Modify-Write ueber mehrere Dateien, mit Retry bei Schreibkonflikt.
 
-    Analog zu gh_put_file, nur dass der Tree-Eintrag fuer den Pfad mit
-    sha=None gesetzt wird -- das entfernt die Datei im neuen Tree. Funktioniert
-    auch fuer >1-MB-Dateien (die Contents-DELETE-API kann das nicht).
-
-    Gibt True zurueck, wenn geloescht wurde, False wenn die Datei gar nicht
-    existierte (idempotent).
-    """
-    # Existiert die Datei ueberhaupt? Wenn nicht: nichts zu tun.
-    _, existing_sha = gh_get_file(repo, path)
-    if existing_sha is None:
-        return False
-
-    branch = _gh_default_branch(repo)
-
-    ref_url = f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/ref/heads/{branch}"
-    ref = requests.get(ref_url, headers=gh_headers(), timeout=30)
-    ref.raise_for_status()
-    base_commit_sha = ref.json()["object"]["sha"]
-
-    commit = requests.get(
-        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/commits/{base_commit_sha}",
-        headers=gh_headers(), timeout=30,
-    )
-    commit.raise_for_status()
-    base_tree_sha = commit.json()["tree"]["sha"]
-
-    # Tree-Eintrag mit sha=None -> GitHub entfernt die Datei.
-    tree = requests.post(
-        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/trees",
-        headers=gh_headers(), timeout=30,
-        json={
-            "base_tree": base_tree_sha,
-            "tree": [{
-                "path": path,
-                "mode": "100644",
-                "type": "blob",
-                "sha": None,
-            }],
-        },
-    )
-    tree.raise_for_status()
-    new_tree_sha = tree.json()["sha"]
-
-    new_commit = requests.post(
-        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/commits",
-        headers=gh_headers(), timeout=30,
-        json={
-            "message": message,
-            "tree": new_tree_sha,
-            "parents": [base_commit_sha],
-        },
-    )
-    new_commit.raise_for_status()
-    new_commit_sha = new_commit.json()["sha"]
-
-    upd = requests.patch(
-        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/refs/heads/{branch}",
-        headers=gh_headers(), timeout=30,
-        json={"sha": new_commit_sha, "force": False},
-    )
-    upd.raise_for_status()
-    return True
-
-def gh_update_file_retrying(repo, path, updater_fn, message):
-    """
-    Liest die Datei, wendet updater_fn an und schreibt zurueck.
-
-    Bei einem Schreibkonflikt (parallele Aenderung an der Branch-Spitze)
-    wird der komplette Read-Modify-Write-Zyklus wiederholt. Da das Schreiben
-    jetzt ueber die Git Data API laeuft, meldet sich ein Konflikt beim
-    Ref-Update als HTTP 422 ("Update is not a fast forward").
-
-    Gibt updater_fn None zurueck, ist nichts zu schreiben (z.B. ein
-    Punkte-Schwung, der nur aus Dubletten bestand) -> der GitHub-Commit
-    wird uebersprungen und None zurueckgegeben.
+    updater_fn(existing: {pfad: dict|None}) -> (writes, deletes) | None
+    None bedeutet "nichts zu tun" -> kein leerer Commit.
     """
     for attempt in range(3):
-        existing, sha = gh_get_file(repo, path)
-        new_content = updater_fn(existing)
-        if new_content is None:
+        existing = {}
+        for p in read_paths:
+            content, _ = gh_get_file(repo, p)
+            existing[p] = content
+
+        result = updater_fn(existing)
+        if result is None:
             return None
+        writes, deletes = result
+        if not writes and not deletes:
+            return None
+
         try:
-            gh_put_file(repo, path, new_content, message, sha=sha)
-            return new_content
+            gh_commit_files(repo, writes, deletes, message)
+            return writes
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else None
             if status in (409, 422) and attempt < 2:
                 time.sleep(0.5 * (attempt + 1))
                 continue
             raise
+
+def gh_put_file(repo, path, content_dict, message):
+    """Einzeldatei -- duenner Wrapper um gh_commit_files."""
+    return gh_commit_files(repo, {path: content_dict}, [], message)
 
 # ============================================================================
 # Skipper-Register
@@ -383,16 +377,18 @@ def _maybe_update_last_seen(token):
     if now - last < LAST_SEEN_THROTTLE_SEC:
         return
     _last_seen_debounce[token] = now
+
     def update(existing):
-        data = existing or {"skippers": []}
+        data = existing["skippers.json"] or {"skippers": []}
         for s in data.get("skippers", []):
             if s.get("token") == token:
                 s["last_seen_at"] = now_iso()
                 break
-        return data
+        return {"skippers.json": data}, []
+
     try:
-        gh_update_file_retrying(
-            ADMIN_REPO, "skippers.json", update, f"last_seen: {token[:8]}..."
+        gh_update_files_retrying(
+            ADMIN_REPO, ["skippers.json"], update, f"last_seen: {token[:8]}..."
         )
     except Exception:
         pass
@@ -404,20 +400,21 @@ def _maybe_update_last_seen(token):
 @app.route("/skippers/new", methods=["POST"])
 def new_skipper():
     token = generate_skipper_token()
+
     def update(existing):
-        data = existing or {"skippers": []}
+        data = existing["skippers.json"] or {"skippers": []}
         if any(s.get("token") == token for s in data["skippers"]):
             raise ValueError("collision")
-        default_name = f"Skipper-{token[:6]}"
         data["skippers"].append({
             "token": token,
-            "name": default_name,
+            "name": f"Skipper-{token[:6]}",
             "created_at": now_iso(),
             "last_seen_at": now_iso(),
         })
-        return data
-    gh_update_file_retrying(
-        ADMIN_REPO, "skippers.json", update, f"skipper new: {token[:8]}..."
+        return {"skippers.json": data}, []
+
+    gh_update_files_retrying(
+        ADMIN_REPO, ["skippers.json"], update, f"skipper new: {token[:8]}..."
     )
     return jsonify({"token": token, "name": f"Skipper-{token[:6]}"})
 
@@ -430,7 +427,7 @@ def whoami():
     return jsonify({"name": name})
 
 # ============================================================================
-# Admin
+# Admin-Index
 # ============================================================================
 
 @app.route("/admin/skippers", methods=["GET"])
@@ -447,16 +444,18 @@ def admin_patch_skipper(token):
     new_name = body.get("name", "").strip()
     if not new_name:
         return jsonify({"error": "name required"}), 400
+
     def update(existing):
-        data = existing or {"skippers": []}
+        data = existing["skippers.json"] or {"skippers": []}
         for s in data.get("skippers", []):
             if s.get("token") == token:
                 s["name"] = new_name
-                return data
+                return {"skippers.json": data}, []
         raise ValueError("skipper not found")
+
     try:
-        gh_update_file_retrying(
-            ADMIN_REPO, "skippers.json", update, f"admin: rename {token[:8]}"
+        gh_update_files_retrying(
+            ADMIN_REPO, ["skippers.json"], update, f"admin: rename {token[:8]}"
         )
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
@@ -464,42 +463,50 @@ def admin_patch_skipper(token):
 
 def admin_index_upsert(entry):
     def update(existing):
-        data = existing or {"tracks": []}
-        found = False
+        data = existing["index.json"] or {"tracks": []}
         for i, t in enumerate(data["tracks"]):
             if t["id"] == entry["id"]:
                 data["tracks"][i] = {**t, **entry}
-                found = True
                 break
-        if not found:
+        else:
             data["tracks"].append(entry)
-        return data
-    gh_update_file_retrying(
-        ADMIN_REPO, "index.json", update, f"admin: upsert {entry['id']}"
+        return {"index.json": data}, []
+
+    gh_update_files_retrying(
+        ADMIN_REPO, ["index.json"], update, f"admin: upsert {entry['id']}"
     )
 
 def admin_index_remove(track_id):
-    """Entfernt einen Track-Eintrag aus dem Admin-Index. Idempotent:
-    fehlt der Eintrag (oder die Index-Datei) bereits, passiert nichts."""
     def update(existing):
-        if not existing or "tracks" not in existing:
-            return None  # nichts zu schreiben
-        before = len(existing["tracks"])
-        existing["tracks"] = [t for t in existing["tracks"] if t.get("id") != track_id]
-        if len(existing["tracks"]) == before:
-            return None  # war nicht drin -> kein leerer Commit
-        return existing
-    gh_update_file_retrying(
-        ADMIN_REPO, "index.json", update, f"admin: remove {track_id}"
+        data = existing["index.json"]
+        if not data or "tracks" not in data:
+            return None
+        before = len(data["tracks"])
+        data["tracks"] = [t for t in data["tracks"] if t.get("id") != track_id]
+        if len(data["tracks"]) == before:
+            return None
+        return {"index.json": data}, []
+
+    gh_update_files_retrying(
+        ADMIN_REPO, ["index.json"], update, f"admin: remove {track_id}"
     )
 
 # ============================================================================
-# Track-Struktur (v2: flat LineString)
+# Track-Struktur (v3)
 # ============================================================================
 
-def empty_track(track_id, name, boat, skipper, trip_start=None, trip_end=None):
+def empty_manifest(track_id, name, boat, skipper, trip_start=None, trip_end=None):
+    """
+    Das Manifest ist die einzige Datei, die das Frontend ueber den Code direkt
+    findet. Es traegt die Toern-Meta und den Segment-Index -- aber KEINE Punkte.
+
+    Jeder Segment-Eintrag haelt `point_count` und `ts_hash` redundant zur
+    Segmentdatei. Das ist Absicht: GET /digest wird damit zu EINEM kleinen
+    Dateizugriff statt zu einem Vollscan ueber alle Segmente.
+    """
     return {
-        "type": "FeatureCollection",
+        "version": 3,
+        "type": "TrackManifest",
         "properties": {
             "id": track_id,
             "name": name,
@@ -509,10 +516,41 @@ def empty_track(track_id, name, boat, skipper, trip_start=None, trip_end=None):
             "trip_end": trip_end,
             "status": "active",
             "created_at": now_iso(),
-            "pauses": [],
             "stats": {
                 "distance_total_nm": 0.0,
                 "point_count": 0,
+                "segment_count": 0,
+            },
+        },
+        "segments": [],
+    }
+
+def empty_segment(track_id, seg, anchor=None):
+    """
+    Eine Segmentdatei ist ein eigenstaendiges GeoJSON -- bewusst so, damit das
+    Frontend sie ohne Umbau rendern und ein Nutzer sie einzeln herunterladen
+    kann.
+
+    `anchor` dokumentiert, WORAUF sich die Zeitstempel dieses Segments
+    beziehen: welcher Wall-Clock-Wert beim Verankern galt, auf welchem Boot,
+    und ob dabei ein Uhrsprung erkannt wurde. Genau diese Information hat beim
+    Ibiza-Toern gefehlt -- die Rekonstruktion des +3557-s-Versatzes musste
+    muehsam aus 67.000 Punkten erfolgen.
+    """
+    return {
+        "type": "FeatureCollection",
+        "properties": {
+            "version": 3,
+            "track_id": track_id,
+            "segment": seg,
+            "opened_at": now_iso(),
+            "closed_at": None,
+            "anchor": anchor or {},
+            "stats": {
+                "distance_nm": 0.0,
+                "point_count": 0,
+                "t_start": None,
+                "t_stop": None,
             },
         },
         "features": [{
@@ -522,40 +560,106 @@ def empty_track(track_id, name, boat, skipper, trip_start=None, trip_end=None):
         }],
     }
 
-def recalc_stats(track):
-    """Distanz neu berechnen über alle Punkte, mit Sprüngen über Pausen."""
-    feat = track["features"][0]
+def recalc_segment(seg_doc):
+    """Distanz, Punktzahl, t-Bereich und Hash EINES Segments neu rechnen.
+
+    Kein Pausen-Sonderfall mehr: Ein Segment ist per Definition eine
+    ununterbrochene Aufnahme. Wo frueher eine Pause lag, endet heute die Datei.
+    """
+    feat = seg_doc["features"][0]
     coords = feat["geometry"]["coordinates"]
     timestamps = feat["properties"]["timestamps"]
-    pauses = track["properties"].get("pauses", [])
-    pauses_sorted = sorted(pauses)
 
     total_nm = 0.0
     for j in range(1, len(coords)):
-        # Distanz zum vorigen Punkt zählt nur, wenn dazwischen KEINE Pause liegt
-        t_prev = timestamps[j-1]
-        t_cur = timestamps[j]
-        # Pause zwischen t_prev und t_cur?
-        idx = bisect.bisect_left(pauses_sorted, t_prev)
-        crossed_pause = idx < len(pauses_sorted) and pauses_sorted[idx] < t_cur
-        if not crossed_pause:
-            lon1, lat1 = coords[j-1]
-            lon2, lat2 = coords[j]
-            total_nm += haversine_nm(lat1, lon1, lat2, lon2)
+        lon1, lat1 = coords[j-1]
+        lon2, lat2 = coords[j]
+        total_nm += haversine_nm(lat1, lon1, lat2, lon2)
 
-    track["properties"]["stats"] = {
-        "distance_total_nm": round(total_nm, 3),
+    stats = {
+        "distance_nm": round(total_nm, 3),
         "point_count": len(coords),
+        "t_start": timestamps[0] if timestamps else None,
+        "t_stop": timestamps[-1] if timestamps else None,
+    }
+    seg_doc["properties"]["stats"] = stats
+    return stats
+
+def segment_entry(seg_doc):
+    """Der Eintrag, wie er im Manifest steht."""
+    p = seg_doc["properties"]
+    st = p["stats"]
+    ts = seg_doc["features"][0]["properties"]["timestamps"]
+    return {
+        "id": p["segment"],
+        "file": f"{{hash}}-{p['segment']}.geojson",  # wird unten ersetzt
+        "t_start": st["t_start"],
+        "t_stop": st["t_stop"],
+        "point_count": st["point_count"],
+        "distance_nm": st["distance_nm"],
+        "ts_hash": ts_hash(ts),
+        "anchor": p.get("anchor", {}),
+        "opened_at": p.get("opened_at"),
+        "closed_at": p.get("closed_at"),
+        "closed": p.get("closed_at") is not None,
     }
 
-def load_track_and_check_ownership(track_id, skipper_name):
-    file_hash = hash_code(track_id)
-    track, _ = gh_get_file(DATA_REPO, f"tracks/{file_hash}.geojson")
-    if track is None:
+def manifest_put_segment(manifest, file_hash, seg_doc):
+    """Segment-Eintrag im Manifest ersetzen/anlegen und Aggregate neu rechnen."""
+    entry = segment_entry(seg_doc)
+    entry["file"] = f"{file_hash}-{entry['id']}.geojson"
+
+    segs = manifest.setdefault("segments", [])
+    for i, s in enumerate(segs):
+        if s["id"] == entry["id"]:
+            segs[i] = entry
+            break
+    else:
+        segs.append(entry)
+    segs.sort(key=lambda s: s["id"])
+
+    refresh_manifest_stats(manifest)
+    return manifest
+
+def refresh_manifest_stats(manifest):
+    """
+    Aggregate + Konfliktmarkierung.
+
+    `conflict` heisst: Der t-Bereich dieses Segments ueberlappt den eines
+    anderen. Das ist KEIN Datenschaden (die Dateien sind getrennt, es wird nie
+    ueber Segmentgrenzen sortiert), sondern ein Hinweis, dass mindestens einer
+    der beiden Anker daneben lag. Die App zeigt das an; korrigiert wird per
+    /shift, in Ruhe, im Nachhinein.
+    """
+    segs = manifest.get("segments", [])
+
+    total_nm = sum(s.get("distance_nm") or 0.0 for s in segs)
+    total_pts = sum(s.get("point_count") or 0 for s in segs)
+
+    for s in segs:
+        s["conflict"] = False
+    for i, a in enumerate(segs):
+        if a["t_start"] is None or a["t_stop"] is None:
+            continue
+        for b in segs[i+1:]:
+            if b["t_start"] is None or b["t_stop"] is None:
+                continue
+            if a["t_start"] <= b["t_stop"] and b["t_start"] <= a["t_stop"]:
+                a["conflict"] = True
+                b["conflict"] = True
+
+    manifest["properties"]["stats"] = {
+        "distance_total_nm": round(total_nm, 3),
+        "point_count": total_pts,
+        "segment_count": len(segs),
+    }
+    return manifest
+
+def check_owner(manifest, skipper_name):
+    if manifest is None:
         raise LookupError("track not found")
-    if track["properties"].get("skipper") != skipper_name:
+    if manifest["properties"].get("skipper") != skipper_name:
         raise PermissionError("not owner")
-    return track, file_hash
 
 # ============================================================================
 # Track-Endpoints
@@ -566,7 +670,8 @@ def root():
     return jsonify({
         "service": "sailtrack-backend",
         "status": "ok",
-        "phase": "2c",
+        "version": 3,
+        "model": "segment-split",
     })
 
 @app.route("/tracks", methods=["POST"])
@@ -580,21 +685,20 @@ def create_track():
     boat = body.get("boat", "").strip() or "–"
     trip_start = body.get("trip_start")
     trip_end = body.get("trip_end")
+
     code = generate_code()
     file_hash = hash_code(code)
-    track_id = code
-    track = empty_track(track_id, name, boat, skipper_name, trip_start, trip_end)
-    gh_put_file(
-        DATA_REPO, f"tracks/{file_hash}.geojson",
-        track, f"create track {file_hash[:8]}"
-    )
+    manifest = empty_manifest(code, name, boat, skipper_name, trip_start, trip_end)
+
+    gh_put_file(DATA_REPO, manifest_path(file_hash), manifest,
+                f"create track {file_hash[:8]}")
     admin_index_upsert({
-        "id": track_id, "code": code, "file_hash": file_hash,
+        "id": code, "code": code, "file_hash": file_hash,
         "name": name, "boat": boat, "skipper": skipper_name,
         "trip_start": trip_start, "trip_end": trip_end,
-        "status": "active", "created_at": track["properties"]["created_at"],
+        "status": "active", "created_at": manifest["properties"]["created_at"],
     })
-    return jsonify({"id": track_id, "code": code, "file_hash": file_hash})
+    return jsonify({"id": code, "code": code, "file_hash": file_hash})
 
 @app.route("/tracks/<track_id>", methods=["PATCH"])
 def patch_track(track_id):
@@ -607,81 +711,137 @@ def patch_track(track_id):
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
         return jsonify({"error": "no valid fields"}), 400
+
     file_hash = hash_code(track_id)
+    mpath = manifest_path(file_hash)
+
     def update(existing):
-        if existing is None:
-            raise LookupError("track not found")
-        if existing["properties"].get("skipper") != skipper_name:
-            raise PermissionError("not owner")
+        m = existing[mpath]
+        check_owner(m, skipper_name)
         for k, v in updates.items():
-            existing["properties"][k] = v
-        return existing
+            m["properties"][k] = v
+        return {mpath: m}, []
+
     try:
-        gh_update_file_retrying(
-            DATA_REPO, f"tracks/{file_hash}.geojson", update,
+        gh_update_files_retrying(
+            DATA_REPO, [mpath], update,
             f"patch {file_hash[:8]}: {','.join(updates.keys())}"
         )
     except LookupError as e:
         return jsonify({"error": str(e)}), 404
     except PermissionError as e:
         return jsonify({"error": str(e)}), 403
+
     admin_index_upsert({"id": track_id, **updates})
     return jsonify({"id": track_id, **updates})
 
 # ============================================================================
-# Points (v2: ohne session_index, chronologisch sortiert)
+# Segmente
 # ============================================================================
 
-@app.route("/tracks/<track_id>/points", methods=["POST"])
-def append_points(track_id):
+@app.route("/tracks/<track_id>/segments", methods=["POST"])
+def open_segment(track_id):
+    """
+    Oeffnet ein Segment. Body: {seg: "s001", anchor: {...}}
+
+    Idempotent: Existiert das Segment schon, ist das ein Erfolg -- die App darf
+    den Aufruf nach einem unklaren Fehlschlag gefahrlos wiederholen. Der Anker
+    wird dabei NICHT ueberschrieben; er gehoert dem Segment und aendert sich nur
+    ueber /shift.
+    """
     skipper = auth_skipper()
     if not skipper:
         return jsonify({"error": "unauthorized"}), 401
     skipper_name, _ = skipper
 
     body = request.get_json(force=True, silent=True) or {}
+    seg = (body.get("seg") or "").strip()
+    if not SEG_RE.match(seg):
+        return jsonify({"error": "seg must look like s001"}), 400
+    anchor = body.get("anchor") or {}
+
+    file_hash = hash_code(track_id)
+    mpath = manifest_path(file_hash)
+    spath = segment_path(file_hash, seg)
+
+    def update(existing):
+        m = existing[mpath]
+        check_owner(m, skipper_name)
+        s = existing[spath]
+        if s is not None:
+            return None  # schon da -> nichts zu tun
+        s = empty_segment(track_id, seg, anchor)
+        recalc_segment(s)
+        manifest_put_segment(m, file_hash, s)
+        return {spath: s, mpath: m}, []
+
+    try:
+        gh_update_files_retrying(
+            DATA_REPO, [mpath, spath], update,
+            f"open segment {seg} on {file_hash[:8]}"
+        )
+    except LookupError as e:
+        return jsonify({"error": str(e)}), 404
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+
+    return jsonify({"seg": seg, "file": f"{file_hash}-{seg}.geojson"})
+
+@app.route("/tracks/<track_id>/segments/<seg>/points", methods=["POST"])
+def append_points(track_id, seg):
+    """
+    Body: {points: [{t, lat, lon}, ...]}
+
+    Dubletten werden uebersprungen -- INNERHALB dieses Segments. Sendet die App
+    nach einem unklaren Fehlschlag denselben Schwung erneut, passiert nichts
+    Doppeltes. Dass dieselbe Sekunde in einem ANDEREN Segment vorkommt, ist
+    dagegen voellig in Ordnung und wird hier nicht geprueft: Ab v3 ist die
+    Punkt-Identitaet (track, segment, t).
+    """
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+
+    if not SEG_RE.match(seg):
+        return jsonify({"error": "bad seg"}), 400
+
+    body = request.get_json(force=True, silent=True) or {}
     points = body.get("points", [])
     if not points:
-        return jsonify({"accepted": 0})
-
-    # Punkte vorsortieren nach Zeit, damit der Server-Code simpel bleibt
+        return jsonify({"accepted": 0, "duplicates": 0})
     points = sorted(points, key=lambda p: p["t"])
 
     file_hash = hash_code(track_id)
+    mpath = manifest_path(file_hash)
+    spath = segment_path(file_hash, seg)
 
-    # Wird vom updater befuellt, damit die Response die echten Zahlen kennt.
-    # Liste, damit die innere Closure schreiben kann (kein nonlocal noetig).
     result = {"accepted": 0, "duplicates": 0}
 
     def update(existing):
-        if existing is None:
-            raise LookupError("track not found")
-        if existing["properties"].get("skipper") != skipper_name:
-            raise PermissionError("not owner")
-        feat = existing["features"][0]
+        m = existing[mpath]
+        check_owner(m, skipper_name)
+        s = existing[spath]
+        if s is None:
+            raise LookupError("segment not found")
+
+        feat = s["features"][0]
         coords = feat["geometry"]["coordinates"]
         timestamps = feat["properties"]["timestamps"]
-
-        # Set der bereits vorhandenen Timestamps fuer O(1)-Dublettenpruefung.
-        # Macht den Append idempotent: Sendet die App nach einem
-        # unklaren Fehlschlag denselben Schwung erneut, werden bereits
-        # gespeicherte Punkte uebersprungen statt doppelt eingefuegt.
         seen = set(timestamps)
+
         accepted = 0
         duplicates = 0
-
         for p in points:
-            t, lat, lon = p["t"], p["lat"], p["lon"]
+            t, lat, lon = int(p["t"]), p["lat"], p["lon"]
             if t in seen:
                 duplicates += 1
                 continue
             seen.add(t)
-            # Üblicher Fall: chronologisch hinten anhängen
             if not timestamps or t >= timestamps[-1]:
                 timestamps.append(t)
                 coords.append([lon, lat])
             else:
-                # Out-of-order: an die korrekte Stelle einsortieren
                 idx = bisect.bisect_left(timestamps, t)
                 timestamps.insert(idx, t)
                 coords.insert(idx, [lon, lat])
@@ -689,92 +849,161 @@ def append_points(track_id):
 
         result["accepted"] = accepted
         result["duplicates"] = duplicates
-
-        # Hat der Schwung ausschliesslich Dubletten enthalten, ist nichts
-        # zu schreiben -> None signalisiert gh_update_file_retrying, den
-        # GitHub-Commit zu ueberspringen (spart einen leeren Commit).
         if accepted == 0:
             return None
 
-        recalc_stats(existing)
-        return existing
+        recalc_segment(s)
+        manifest_put_segment(m, file_hash, s)
+        return {spath: s, mpath: m}, []
 
     try:
-        gh_update_file_retrying(
-            DATA_REPO, f"tracks/{file_hash}.geojson", update,
-            f"append {len(points)} pts to {file_hash[:8]}"
+        gh_update_files_retrying(
+            DATA_REPO, [mpath, spath], update,
+            f"append {len(points)} pts to {file_hash[:8]}/{seg}"
         )
     except LookupError as e:
         return jsonify({"error": str(e)}), 404
     except PermissionError as e:
         return jsonify({"error": str(e)}), 403
 
-    return jsonify({
-        "accepted": result["accepted"],
-        "duplicates": result["duplicates"],
-    })
+    return jsonify(result)
 
-@app.route("/tracks/<track_id>/pauses", methods=["POST"])
-def add_pause(track_id):
+@app.route("/tracks/<track_id>/segments/<seg>/close", methods=["POST"])
+def close_segment(track_id, seg):
+    """Segment schliessen. Danach kommen keine Punkte mehr dazu.
+
+    Nicht erzwungen -- der Server bleibt dumm. Es ist eine Markierung fuer die
+    App und das Frontend, kein Schreibschutz.
+    """
     skipper = auth_skipper()
     if not skipper:
         return jsonify({"error": "unauthorized"}), 401
     skipper_name, _ = skipper
-
-    body = request.get_json(force=True, silent=True) or {}
-    t = body.get("t")
-    if t is None:
-        return jsonify({"error": "t required"}), 400
+    if not SEG_RE.match(seg):
+        return jsonify({"error": "bad seg"}), 400
 
     file_hash = hash_code(track_id)
+    mpath = manifest_path(file_hash)
+    spath = segment_path(file_hash, seg)
 
     def update(existing):
-        if existing is None:
-            raise LookupError("track not found")
-        if existing["properties"].get("skipper") != skipper_name:
-            raise PermissionError("not owner")
-        pauses = existing["properties"].setdefault("pauses", [])
-        if t not in pauses:
-            pauses.append(t)
-            pauses.sort()
-        recalc_stats(existing)
-        return existing
+        m = existing[mpath]
+        check_owner(m, skipper_name)
+        s = existing[spath]
+        if s is None:
+            raise LookupError("segment not found")
+        if s["properties"].get("closed_at"):
+            return None
+        s["properties"]["closed_at"] = now_iso()
+        recalc_segment(s)
+        manifest_put_segment(m, file_hash, s)
+        return {spath: s, mpath: m}, []
 
     try:
-        gh_update_file_retrying(
-            DATA_REPO, f"tracks/{file_hash}.geojson", update,
-            f"pause @ {t} on {file_hash[:8]}"
+        gh_update_files_retrying(
+            DATA_REPO, [mpath, spath], update,
+            f"close segment {seg} on {file_hash[:8]}"
         )
     except LookupError as e:
         return jsonify({"error": str(e)}), 404
     except PermissionError as e:
         return jsonify({"error": str(e)}), 403
 
-    return jsonify({"t": t})
+    return jsonify({"seg": seg, "closed": True})
+
+@app.route("/tracks/<track_id>/segments/<seg>/shift", methods=["POST"])
+def shift_segment(track_id, seg):
+    """
+    Verschiebt ALLE Zeitstempel eines Segments um `delta` Sekunden.
+    Body: {delta: -3557}
+
+    Das ist die Reparatur fuer einen falschen Anker (Reboot mitten im Toern,
+    Systemuhr stand daneben). Weil alle Stempel um denselben Betrag wandern,
+    bleibt die Reihenfolge erhalten -- es muss nichts umsortiert werden, und es
+    kann innerhalb des Segments keine Dublette entstehen.
+
+    Eine Ueberlappung mit einem anderen Segment ist ausdruecklich ERLAUBT und
+    wird nur als `conflict` markiert. Getrennte Dateien, keine gemeinsame
+    Sortierung -- das ist der ganze Sinn des Splits.
+
+    Der Anker der Datei wandert mit, sonst wuerde ein spaeteres Fortsetzen der
+    Aufnahme wieder auf die alte Zeitbasis zurueckfallen.
+    """
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+    if not SEG_RE.match(seg):
+        return jsonify({"error": "bad seg"}), 400
+
+    body = request.get_json(force=True, silent=True) or {}
+    delta = body.get("delta")
+    if not isinstance(delta, int) or delta == 0:
+        return jsonify({"error": "delta must be a non-zero int (seconds)"}), 400
+
+    file_hash = hash_code(track_id)
+    mpath = manifest_path(file_hash)
+    spath = segment_path(file_hash, seg)
+
+    def update(existing):
+        m = existing[mpath]
+        check_owner(m, skipper_name)
+        s = existing[spath]
+        if s is None:
+            raise LookupError("segment not found")
+
+        feat = s["features"][0]
+        feat["properties"]["timestamps"] = [
+            int(t) + delta for t in feat["properties"]["timestamps"]
+        ]
+
+        anchor = s["properties"].setdefault("anchor", {})
+        if isinstance(anchor.get("wall_anchor_ms"), int):
+            anchor["wall_anchor_ms"] += delta * 1000
+        hist = anchor.setdefault("shifts", [])
+        hist.append({"delta": delta, "at": now_iso()})
+
+        recalc_segment(s)
+        manifest_put_segment(m, file_hash, s)
+        return {spath: s, mpath: m}, []
+
+    try:
+        gh_update_files_retrying(
+            DATA_REPO, [mpath, spath], update,
+            f"shift {seg} by {delta}s on {file_hash[:8]}"
+        )
+    except LookupError as e:
+        return jsonify({"error": str(e)}), 404
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+
+    m, _ = gh_get_file(DATA_REPO, mpath)
+    entry = next((x for x in m["segments"] if x["id"] == seg), None)
+    return jsonify({"seg": seg, "delta": delta, "segment": entry})
 
 # ============================================================================
-# Status-Toggle
+# Status
 # ============================================================================
 
 def _set_status(track_id, new_status, skipper_name):
     file_hash = hash_code(track_id)
+    mpath = manifest_path(file_hash)
+
     def update(existing):
-        if existing is None:
-            raise LookupError("track not found")
-        if existing["properties"].get("skipper") != skipper_name:
-            raise PermissionError("not owner")
-        existing["properties"]["status"] = new_status
+        m = existing[mpath]
+        check_owner(m, skipper_name)
+        m["properties"]["status"] = new_status
         if new_status == "finished":
-            existing["properties"]["finished_at"] = now_iso()
+            m["properties"]["finished_at"] = now_iso()
         else:
-            existing["properties"].pop("finished_at", None)
-        return existing
-    updated = gh_update_file_retrying(
-        DATA_REPO, f"tracks/{file_hash}.geojson", update,
-        f"status->{new_status} {file_hash[:8]}"
+            m["properties"].pop("finished_at", None)
+        return {mpath: m}, []
+
+    written = gh_update_files_retrying(
+        DATA_REPO, [mpath], update, f"status->{new_status} {file_hash[:8]}"
     )
     admin_index_upsert({"id": track_id, "status": new_status})
-    return updated
+    return written[mpath] if written else None
 
 @app.route("/tracks/<track_id>/finish", methods=["POST"])
 def finish_track(track_id):
@@ -783,12 +1012,13 @@ def finish_track(track_id):
         return jsonify({"error": "unauthorized"}), 401
     skipper_name, _ = skipper
     try:
-        updated = _set_status(track_id, "finished", skipper_name)
+        m = _set_status(track_id, "finished", skipper_name)
     except LookupError as e:
         return jsonify({"error": str(e)}), 404
     except PermissionError as e:
         return jsonify({"error": str(e)}), 403
-    return jsonify({"status": "finished", "stats": updated["properties"]["stats"]})
+    return jsonify({"status": "finished",
+                    "stats": m["properties"]["stats"] if m else None})
 
 @app.route("/tracks/<track_id>/reopen", methods=["POST"])
 def reopen_track(track_id):
@@ -797,15 +1027,16 @@ def reopen_track(track_id):
         return jsonify({"error": "unauthorized"}), 401
     skipper_name, _ = skipper
     try:
-        updated = _set_status(track_id, "active", skipper_name)
+        m = _set_status(track_id, "active", skipper_name)
     except LookupError as e:
         return jsonify({"error": str(e)}), 404
     except PermissionError as e:
         return jsonify({"error": str(e)}), 403
-    return jsonify({"status": "active", "stats": updated["properties"]["stats"]})
+    return jsonify({"status": "active",
+                    "stats": m["properties"]["stats"] if m else None})
 
 # ============================================================================
-# Listings
+# Lesen
 # ============================================================================
 
 @app.route("/tracks", methods=["GET"])
@@ -826,80 +1057,224 @@ def list_my_tracks():
 
 @app.route("/tracks/<track_id>", methods=["GET"])
 def get_track(track_id):
+    """Nur das Manifest -- klein, ohne Punkte."""
     skipper = auth_skipper()
     if not skipper:
         return jsonify({"error": "unauthorized"}), 401
     skipper_name, _ = skipper
-    file_hash = hash_code(track_id)
-    existing, _ = gh_get_file(DATA_REPO, f"tracks/{file_hash}.geojson")
-    if not existing:
+    m, _ = gh_get_file(DATA_REPO, manifest_path(hash_code(track_id)))
+    try:
+        check_owner(m, skipper_name)
+    except LookupError:
         return jsonify({"error": "track not found"}), 404
-    if existing["properties"].get("skipper") != skipper_name:
+    except PermissionError:
         return jsonify({"error": "not owner"}), 403
-    return jsonify(existing)
+    return jsonify(m)
+
+@app.route("/tracks/<track_id>/segments/<seg>", methods=["GET"])
+def get_segment(track_id, seg):
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+    if not SEG_RE.match(seg):
+        return jsonify({"error": "bad seg"}), 400
+
+    file_hash = hash_code(track_id)
+    m, _ = gh_get_file(DATA_REPO, manifest_path(file_hash))
+    try:
+        check_owner(m, skipper_name)
+    except LookupError:
+        return jsonify({"error": "track not found"}), 404
+    except PermissionError:
+        return jsonify({"error": "not owner"}), 403
+
+    s, _ = gh_get_file(DATA_REPO, segment_path(file_hash, seg))
+    if s is None:
+        return jsonify({"error": "segment not found"}), 404
+    return jsonify(s)
 
 @app.route("/tracks/<track_id>/digest", methods=["GET"])
 def get_track_digest(track_id):
     """
-    Schlanker Fingerabdruck eines Tracks: nur point_count, last_t und ts_hash
-    -- ein paar Bytes statt des kompletten GeoJSON. Die App vergleicht das vor
-    dem "Daten vom Geraet entfernen", um sicherzugehen, dass der Server exakt
-    die lokale Punktmenge hat. Stimmen Anzahl UND Hash, ist Loeschen sicher.
+    Fingerabdruck PRO SEGMENT -- aus dem Manifest, ohne die Segmentdateien
+    anzufassen. Ein Dateizugriff, ein paar hundert Bytes.
+
+    Die App vergleicht das vor "Daten vom Geraet entfernen": Stimmen fuer jedes
+    Segment point_count UND ts_hash mit dem lokalen Bestand, ist Loeschen sicher.
     """
     skipper = auth_skipper()
     if not skipper:
         return jsonify({"error": "unauthorized"}), 401
     skipper_name, _ = skipper
-    file_hash = hash_code(track_id)
-    existing, _ = gh_get_file(DATA_REPO, f"tracks/{file_hash}.geojson")
-    if not existing:
+
+    m, _ = gh_get_file(DATA_REPO, manifest_path(hash_code(track_id)))
+    try:
+        check_owner(m, skipper_name)
+    except LookupError:
         return jsonify({"error": "track not found"}), 404
-    if existing["properties"].get("skipper") != skipper_name:
+    except PermissionError:
         return jsonify({"error": "not owner"}), 403
-    timestamps = existing["features"][0]["properties"].get("timestamps", [])
-    norm = _norm_ts(timestamps)
+
+    segs = [{
+        "id": s["id"],
+        "point_count": s["point_count"],
+        "last_t": s["t_stop"],
+        "ts_hash": s["ts_hash"],
+        "closed": s.get("closed", False),
+        "conflict": s.get("conflict", False),
+    } for s in m.get("segments", [])]
+
     return jsonify({
-        "point_count": len(norm),
-        "last_t": norm[-1] if norm else None,
-        "ts_hash": ts_hash(timestamps),
+        "segments": segs,
+        "point_count": m["properties"]["stats"]["point_count"],
+        "segment_count": len(segs),
     })
 
 @app.route("/tracks/<track_id>", methods=["DELETE"])
 def delete_track(track_id):
-    """
-    Loescht einen Track endgueltig: GeoJSON aus dem Daten-Repo + Eintrag aus
-    dem Admin-Index. Danach ist der Toern auch ueber den oeffentlichen Link
-    (track.html) nicht mehr erreichbar.
-
-    Idempotent: Ist die Datei schon weg (404), gilt das als Erfolg, damit ein
-    aus der App-Warteschlange erneut gesendeter Loeschbefehl sauber durchlaeuft
-    statt haengenzubleiben. Der Index wird in dem Fall trotzdem bereinigt.
-    """
+    """Manifest + alle Segmentdateien, in einem Commit. Idempotent."""
     skipper = auth_skipper()
     if not skipper:
         return jsonify({"error": "unauthorized"}), 401
     skipper_name, _ = skipper
-    file_hash = hash_code(track_id)
 
-    existing, _ = gh_get_file(DATA_REPO, f"tracks/{file_hash}.geojson")
-    if existing is None:
-        # Schon geloescht -> Index sicherheitshalber aufraeumen, Erfolg melden.
+    file_hash = hash_code(track_id)
+    m, _ = gh_get_file(DATA_REPO, manifest_path(file_hash))
+    if m is None:
         admin_index_remove(track_id)
         return jsonify({"deleted": True, "already_gone": True})
-    if existing["properties"].get("skipper") != skipper_name:
+    if m["properties"].get("skipper") != skipper_name:
         return jsonify({"error": "not owner"}), 403
 
-    gh_delete_file(DATA_REPO, f"tracks/{file_hash}.geojson",
-                   f"delete track {file_hash[:8]}")
+    paths = gh_list_dir(DATA_REPO, track_dir(file_hash))
+    if paths:
+        gh_commit_files(DATA_REPO, {}, paths, f"delete track {file_hash[:8]}")
     admin_index_remove(track_id)
-    return jsonify({"deleted": True})
+    return jsonify({"deleted": True, "files": len(paths)})
 
-@app.route("/admin/index", methods=["GET"])
-def admin_index():
+# ============================================================================
+# Migration v2 -> v3
+# ============================================================================
+
+def split_v2_at_pauses(coords, timestamps, pauses):
+    """
+    Zerlegt den flachen v2-LineString an den Pausen.
+
+    Identisch zur Logik, die das alte Frontend (track.html) benutzt hat --
+    absichtlich, damit die Migration genau die Segmente erzeugt, die man dort
+    schon gesehen hat. Pausen entstanden beim stopTracking, ein Abschnitt
+    zwischen zwei Pausen ist also genau eine Aufnahme.
+    """
+    pauses_sorted = sorted(pauses or [])
+    out = []
+    cur_c, cur_t = [], []
+    pi = 0
+    for i, t in enumerate(timestamps):
+        while pi < len(pauses_sorted) and pauses_sorted[pi] < t:
+            if cur_c:
+                out.append((cur_c, cur_t))
+                cur_c, cur_t = [], []
+            pi += 1
+        cur_c.append(coords[i])
+        cur_t.append(int(t))
+    if cur_c:
+        out.append((cur_c, cur_t))
+    return out
+
+def migrate_one(track_id, dry_run=False):
+    """Einen v2-Track ins v3-Layout ueberfuehren. Gibt eine Zusammenfassung."""
+    file_hash = hash_code(track_id)
+    old, _ = gh_get_file(DATA_REPO, legacy_path(file_hash))
+    if old is None:
+        return {"id": track_id, "skipped": "no v2 file"}
+
+    props = old["properties"]
+    feat = old["features"][0]
+    coords = feat["geometry"]["coordinates"]
+    timestamps = feat["properties"].get("timestamps", [])
+    pauses = props.get("pauses", [])
+
+    parts = split_v2_at_pauses(coords, timestamps, pauses)
+
+    manifest = empty_manifest(
+        track_id, props.get("name", ""), props.get("boat", "–"),
+        props.get("skipper", ""), props.get("trip_start"), props.get("trip_end"),
+    )
+    manifest["properties"]["status"] = props.get("status", "active")
+    manifest["properties"]["created_at"] = props.get("created_at", now_iso())
+    if props.get("finished_at"):
+        manifest["properties"]["finished_at"] = props["finished_at"]
+    manifest["properties"]["migrated_from"] = "v2"
+
+    writes = {}
+    for i, (c, t) in enumerate(parts, start=1):
+        seg = f"s{i:03d}"
+        s = empty_segment(track_id, seg, anchor={
+            # Der Anker ist fuer Alt-Toerns unbekannt -- es gab ihn nie.
+            # Ehrlich als null markieren statt etwas zu erfinden.
+            "known": False,
+            "migrated": True,
+        })
+        s["features"][0]["geometry"]["coordinates"] = c
+        s["features"][0]["properties"]["timestamps"] = t
+        s["properties"]["opened_at"] = None
+        s["properties"]["closed_at"] = now_iso()
+        recalc_segment(s)
+        manifest_put_segment(manifest, file_hash, s)
+        writes[segment_path(file_hash, seg)] = s
+
+    writes[manifest_path(file_hash)] = manifest
+
+    summary = {
+        "id": track_id,
+        "segments": len(parts),
+        "points": sum(len(t) for _, t in parts),
+        "distance_nm": manifest["properties"]["stats"]["distance_total_nm"],
+        "old_distance_nm": (props.get("stats") or {}).get("distance_total_nm"),
+    }
+    if dry_run:
+        summary["dry_run"] = True
+        return summary
+
+    gh_commit_files(
+        DATA_REPO, writes, [legacy_path(file_hash)],
+        f"migrate {file_hash[:8]} v2->v3 ({len(parts)} segments)"
+    )
+    return summary
+
+@app.route("/admin/migrate", methods=["POST"])
+def admin_migrate():
+    """
+    Migriert alle im Admin-Index gelisteten Toerns.
+
+    Body: {"dry_run": true}  -> nichts wird geschrieben, nur gerechnet.
+    Body: {"ids": ["ABC..."]} -> nur diese.
+
+    Vorher pruefen lohnt: `distance_nm` (neu, ohne Pausen-Sonderfall) und
+    `old_distance_nm` (v2, das die Pausen uebersprang) muessen praktisch gleich
+    sein. Weichen sie ab, lag im alten Bestand ein Punkt ueber einer Pause --
+    dann bitte nicht blind schreiben, sondern nachschauen.
+    """
     if not auth_admin():
         return jsonify({"error": "unauthorized"}), 401
-    existing, _ = gh_get_file(ADMIN_REPO, "index.json")
-    return jsonify(existing or {"tracks": []})
+    body = request.get_json(force=True, silent=True) or {}
+    dry_run = bool(body.get("dry_run"))
+    only = body.get("ids")
+
+    idx, _ = gh_get_file(ADMIN_REPO, "index.json")
+    tracks = (idx or {}).get("tracks", [])
+    ids = [t["id"] for t in tracks]
+    if only:
+        ids = [i for i in ids if i in only]
+
+    out = []
+    for tid in ids:
+        try:
+            out.append(migrate_one(tid, dry_run=dry_run))
+        except Exception as e:
+            out.append({"id": tid, "error": str(e)})
+    return jsonify({"dry_run": dry_run, "count": len(out), "results": out})
 
 # ============================================================================
 
