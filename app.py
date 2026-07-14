@@ -1119,6 +1119,8 @@ def get_track_digest(track_id):
     segs = [{
         "id": s["id"],
         "point_count": s["point_count"],
+        "t_start": s["t_start"],
+        "t_stop": s["t_stop"],
         "last_t": s["t_stop"],
         "ts_hash": s["ts_hash"],
         "closed": s.get("closed", False),
