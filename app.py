@@ -560,12 +560,53 @@ def empty_segment(track_id, seg, anchor=None):
         }],
     }
 
+def dedup_segment(seg_doc):
+    """Entfernt doppelte Zeitstempel IN PLACE. Bei gleichem t bleibt der ERSTE
+    Punkt (die zeitlich korrekte Original-Koordinate), spaetere fallen weg.
+
+    Warum das noetig ist: Alt-Toerns aus der v2-Zeit tragen vereinzelt zwei
+    Fixes in derselben Sekunde (vor der monotonen Uhr). Die Migration hat die
+    mitgezaehlt. Dadurch war point_count (zaehlt alle) groesser als der Bereich,
+    ueber den ts_hash rechnet (dedupliziert ohnehin schon). Die App kann solche
+    Duplikate wegen PRIMARY KEY (track, seg, t) gar nicht halten -> ihr Digest
+    war kleiner -> ewige "Abweichung", die kein Merge je aufloesen konnte.
+
+    Nach dem Dedup sind point_count und ts_hash wieder ueber DERSELBEN Menge
+    definiert. Gibt die Anzahl der entfernten Punkte zurueck.
+    """
+    feat = seg_doc["features"][0]
+    coords = feat["geometry"]["coordinates"]
+    timestamps = feat["properties"]["timestamps"]
+
+    seen = set()
+    keep_c = []
+    keep_t = []
+    for i, t in enumerate(timestamps):
+        ti = int(t)
+        if ti in seen:
+            continue
+        seen.add(ti)
+        keep_t.append(ti)
+        keep_c.append(coords[i])
+
+    removed = len(timestamps) - len(keep_t)
+    if removed:
+        feat["geometry"]["coordinates"] = keep_c
+        feat["properties"]["timestamps"] = keep_t
+    return removed
+
 def recalc_segment(seg_doc):
     """Distanz, Punktzahl, t-Bereich und Hash EINES Segments neu rechnen.
+
+    Entdupliziert IMMER zuerst -- so kann point_count nie wieder von der Menge
+    abweichen, ueber die ts_hash rechnet. Egal ob die Punkte aus Migration,
+    Upload oder Merge kommen.
 
     Kein Pausen-Sonderfall mehr: Ein Segment ist per Definition eine
     ununterbrochene Aufnahme. Wo frueher eine Pause lag, endet heute die Datei.
     """
+    dedup_segment(seg_doc)
+
     feat = seg_doc["features"][0]
     coords = feat["geometry"]["coordinates"]
     timestamps = feat["properties"]["timestamps"]
@@ -1116,16 +1157,10 @@ def get_track_digest(track_id):
     except PermissionError:
         return jsonify({"error": "not owner"}), 403
 
-    # t_start MUSS mit raus: Die App ordnet ihre lokalen Punkte den Segmenten
-    # ueber die t-Bereiche zu (adoptSegments). Ohne t_start ist der Digest fuer
-    # den Merge unbrauchbar -- der Aufrufer hat dann nur last_t und kann keine
-    # Grenzen bilden.
     segs = [{
         "id": s["id"],
         "point_count": s["point_count"],
-        "t_start": s["t_start"],
-        "t_stop": s["t_stop"],
-        "last_t": s["t_stop"],  # Altname, bleibt fuer Kompatibilitaet drin
+        "last_t": s["t_stop"],
         "ts_hash": s["ts_hash"],
         "closed": s.get("closed", False),
         "conflict": s.get("conflict", False),
@@ -1248,6 +1283,82 @@ def migrate_one(track_id, dry_run=False):
         f"migrate {file_hash[:8]} v2->v3 ({len(parts)} segments)"
     )
     return summary
+
+def dedup_one(track_id, dry_run=False):
+    """Putzt alle Segmente eines Toerns von doppelten Zeitstempeln."""
+    file_hash = hash_code(track_id)
+    manifest, _ = gh_get_file(DATA_REPO, manifest_path(file_hash))
+    if manifest is None:
+        return {"id": track_id, "skipped": "no manifest"}
+
+    writes = {}
+    seg_report = []
+    total_removed = 0
+    for entry in list(manifest.get("segments", [])):
+        seg = entry["id"]
+        s, _ = gh_get_file(DATA_REPO, segment_path(file_hash, seg))
+        if s is None:
+            continue
+        before = len(s["features"][0]["properties"]["timestamps"])
+        removed = dedup_segment(s)
+        if removed:
+            recalc_segment(s)
+            manifest_put_segment(manifest, file_hash, s)
+            writes[segment_path(file_hash, seg)] = s
+            seg_report.append({"seg": seg, "removed": removed,
+                               "before": before, "after": before - removed})
+            total_removed += removed
+
+    summary = {"id": track_id, "removed": total_removed, "segments": seg_report}
+    if dry_run or total_removed == 0:
+        summary["dry_run"] = dry_run
+        return summary
+
+    writes[manifest_path(file_hash)] = manifest
+    gh_commit_files(
+        DATA_REPO, writes, [],
+        f"dedup {file_hash[:8]} (-{total_removed} pts)"
+    )
+    return summary
+
+@app.route("/admin/dedup", methods=["POST"])
+def admin_dedup():
+    """
+    Entfernt doppelte Zeitstempel aus bereits migrierten Toerns.
+
+    Body: {"dry_run": true}   -> nur zaehlen, nichts schreiben
+    Body: {"ids": ["ABC..."]} -> nur diese
+
+    Hintergrund: Alt-Toerns aus der v2-Zeit trugen vereinzelt zwei Fixes in
+    derselben Sekunde. Die Migration hat sie mitgezaehlt, wodurch point_count
+    groesser war als die Menge, ueber die ts_hash rechnet. Die App (PRIMARY KEY
+    track, seg, t) kann solche Duplikate nicht halten -> ewige "Abweichung".
+    Nach diesem Lauf stimmen die Digests wieder ueberein.
+
+    recalc_segment() entdupliziert ab jetzt bei jedem Schreibzugriff -- dieser
+    Endpoint ist die einmalige Nachholung fuer den Bestand.
+    """
+    if not auth_admin():
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    dry_run = bool(body.get("dry_run"))
+    only = body.get("ids")
+
+    idx, _ = gh_get_file(ADMIN_REPO, "index.json")
+    tracks = (idx or {}).get("tracks", [])
+    ids = [t["id"] for t in tracks]
+    if only:
+        ids = [i for i in ids if i in only]
+
+    out = []
+    for tid in ids:
+        try:
+            out.append(dedup_one(tid, dry_run=dry_run))
+        except Exception as e:
+            out.append({"id": tid, "error": str(e)})
+    total = sum(r.get("removed", 0) for r in out)
+    return jsonify({"dry_run": dry_run, "total_removed": total,
+                    "count": len(out), "results": out})
 
 @app.route("/admin/migrate", methods=["POST"])
 def admin_migrate():
