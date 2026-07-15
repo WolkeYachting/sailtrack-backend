@@ -1116,12 +1116,16 @@ def get_track_digest(track_id):
     except PermissionError:
         return jsonify({"error": "not owner"}), 403
 
+    # t_start MUSS mit raus: Die App ordnet ihre lokalen Punkte den Segmenten
+    # ueber die t-Bereiche zu (adoptSegments). Ohne t_start ist der Digest fuer
+    # den Merge unbrauchbar -- der Aufrufer hat dann nur last_t und kann keine
+    # Grenzen bilden.
     segs = [{
         "id": s["id"],
         "point_count": s["point_count"],
         "t_start": s["t_start"],
         "t_stop": s["t_stop"],
-        "last_t": s["t_stop"],
+        "last_t": s["t_stop"],  # Altname, bleibt fuer Kompatibilitaet drin
         "ts_hash": s["ts_hash"],
         "closed": s.get("closed", False),
         "conflict": s.get("conflict", False),
