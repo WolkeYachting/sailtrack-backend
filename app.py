@@ -666,11 +666,29 @@ def refresh_manifest_stats(manifest):
     """
     Aggregate + Konfliktmarkierung.
 
-    `conflict` heisst: Der t-Bereich dieses Segments ueberlappt den eines
-    anderen. Das ist KEIN Datenschaden (die Dateien sind getrennt, es wird nie
-    ueber Segmentgrenzen sortiert), sondern ein Hinweis, dass mindestens einer
-    der beiden Anker daneben lag. Die App zeigt das an; korrigiert wird per
-    /shift, in Ruhe, im Nachhinein.
+    KONFLIKT = REIHENFOLGE-BRUCH.
+
+    Der Split verspricht: Segmentreihenfolge == Zeitreihenfolge. Ein Segment
+    ist konfliktbehaftet, wenn es dieses Versprechen mit seinem Vorgaenger
+    bricht -- wenn also sein t_start VOR dem t_stop des vorherigen Segments
+    liegt:
+
+        t_start(s_n) < t_stop(s_{n-1})   ->   beide markiert
+
+    Das deckt zwei Faelle ab, die dieselbe Ursache haben (ein Anker stand
+    falsch):
+      - Ueberlappung:      s_n beginnt MITTEN im Vorgaenger.
+      - Rueckwaertssprung: s_n beginnt VOR dem Vorgaenger (spaeter
+                           aufgenommen, aber fruehere Uhrzeit). Genau der Fall
+                           aus dem Reboot-Test: s001=13 Uhr, s003=11 Uhr --
+                           die Reihenfolge laeuft der Zeit entgegen.
+
+    Die fruehere Fassung pruefte nur paarweise Ueberlappung und uebersah den
+    Rueckwaertssprung, solange die Bereiche sich nicht zufaellig schnitten.
+
+    Kein Datenschaden in beiden Faellen -- die Dateien sind getrennt, es wird
+    nie ueber Segmentgrenzen sortiert. Nur ein Hinweis, dass ein Anker daneben
+    lag. Korrigiert wird per /shift, in Ruhe, im Nachhinein.
     """
     segs = manifest.get("segments", [])
 
@@ -679,15 +697,20 @@ def refresh_manifest_stats(manifest):
 
     for s in segs:
         s["conflict"] = False
-    for i, a in enumerate(segs):
-        if a["t_start"] is None or a["t_stop"] is None:
+
+    # Nach Segment-ID = Aufnahmereihenfolge. Nachbar gegen Nachbar.
+    ordered = sorted(segs, key=lambda s: s["id"])
+    prev = None
+    for cur in ordered:
+        if cur["t_start"] is None or cur["t_stop"] is None:
+            prev = cur
             continue
-        for b in segs[i+1:]:
-            if b["t_start"] is None or b["t_stop"] is None:
-                continue
-            if a["t_start"] <= b["t_stop"] and b["t_start"] <= a["t_stop"]:
-                a["conflict"] = True
-                b["conflict"] = True
+        if prev is not None and prev["t_stop"] is not None:
+            # Bricht die Aufnahmereihenfolge die Zeitreihenfolge?
+            if cur["t_start"] < prev["t_stop"]:
+                cur["conflict"] = True
+                prev["conflict"] = True
+        prev = cur
 
     manifest["properties"]["stats"] = {
         "distance_total_nm": round(total_nm, 3),
@@ -1309,16 +1332,28 @@ def dedup_one(track_id, dry_run=False):
                                "before": before, "after": before - removed})
             total_removed += removed
 
-    summary = {"id": track_id, "removed": total_removed, "segments": seg_report}
-    if dry_run or total_removed == 0:
+    # Konflikte immer neu bewerten -- auch wenn kein Punkt entfernt wurde. Die
+    # Regel hat sich geaendert (Reihenfolge-Bruch statt nur Ueberlappung), also
+    # koennen Segmente jetzt als conflict gelten, die es vorher nicht taten.
+    before_conf = [s["id"] for s in manifest.get("segments", []) if s.get("conflict")]
+    refresh_manifest_stats(manifest)
+    after_conf = [s["id"] for s in manifest.get("segments", []) if s.get("conflict")]
+    conflicts_changed = before_conf != after_conf
+    summary = {
+        "id": track_id, "removed": total_removed, "segments": seg_report,
+        "conflicts": after_conf,
+    }
+
+    if dry_run:
         summary["dry_run"] = dry_run
         return summary
+    if total_removed == 0 and not conflicts_changed:
+        return summary  # nichts zu schreiben
 
     writes[manifest_path(file_hash)] = manifest
-    gh_commit_files(
-        DATA_REPO, writes, [],
-        f"dedup {file_hash[:8]} (-{total_removed} pts)"
-    )
+    msg = f"dedup {file_hash[:8]} (-{total_removed} pts"
+    msg += ", conflicts updated)" if conflicts_changed else ")"
+    gh_commit_files(DATA_REPO, writes, [], msg)
     return summary
 
 @app.route("/admin/dedup", methods=["POST"])
